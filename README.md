@@ -1,0 +1,35 @@
+# OpenBase
+
+OpenBase 是一个可独立部署的高容量多维数据库。它提供类似多维表格的操作体验，使用 React、Express 和 PostgreSQL 构建，不设置产品级数据行配额，实际容量取决于服务器资源。
+
+## 当前功能
+
+- 项目、数据表、保存视图与可拖拽表格界面
+- 文本、数字、日期、单选、关联记录和查找引用字段
+- 记录新增、修改、软删除、回收站与审计日志
+- 游标分页、多条件筛选和流式 CSV 导出
+- 带唯一导入 ID 的 XLSX 模板与 CSV/XLSX 导入
+- 多账号注册登录、数据隔离和独立管理后台
+- PostgreSQL JSONB 存储与百万行容量验证
+
+## 本地验证
+
+```powershell
+npm install
+npm test
+npm run build
+```
+
+本地运行需要 PostgreSQL。根据 `.env.example` 创建本地 `.env`，不要把真实密码、哈希、Token 或数据库备份提交到仓库。
+
+## 生产部署
+
+项目提供 `Dockerfile` 和 `docker-compose.yml`。数据库仅在 Compose 内部网络使用，应用和管理后台分别监听独立的本机端口，再由 Caddy 或 Nginx 提供外部入口。
+
+通用部署和回滚步骤见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+
+## 安全说明
+
+- `.env`、数据库卷、上传文件、日志和测试截图均已排除在版本控制之外。
+- 用户密码只保存 bcrypt 哈希。
+- 生产数据库在升级前必须先执行 `pg_dump`，代码大改前必须先提交并推送一个 Git 备份节点。

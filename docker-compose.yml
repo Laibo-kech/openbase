@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: multibase
+      POSTGRES_USER: multibase
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - multibase_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U multibase -d multibase"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [multibase]
+
+  app:
+    build: .
+    image: multibase-v1:1.1.0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 13280
+      DATABASE_URL: postgres://multibase:${POSTGRES_PASSWORD}@db:5432/multibase
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:13280:13280"
+    volumes:
+      - ./data/uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:13280/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    networks: [multibase]
+
+  admin:
+    build: .
+    image: multibase-v1:1.1.0
+    command: ["node", "server/admin.mjs"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ADMIN_PORT: 13281
+      DATABASE_URL: postgres://multibase:${POSTGRES_PASSWORD}@db:5432/multibase
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:13281:13281"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:13281/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    networks: [multibase]
+
+networks:
+  multibase:
+    name: multibase-v1
+
+volumes:
+  multibase_pgdata:
+    name: multibase-v1-pgdata
