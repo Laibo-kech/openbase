@@ -38,6 +38,14 @@ docker compose exec -T db pg_dump -U multibase -d multibase -Fc > multibase-befo
 - 服务端日志无重复错误
 - 原入口仍可访问
 
+查找引用候选版本还应执行：
+
+```bash
+LOOKUP_ACCEPTANCE_BASE_URL=http://127.0.0.1:14280 npm run acceptance:lookup
+```
+
+验收覆盖稳定关联 ID、三步配置、单条和多条关联、8 种汇总、4 种返回类型、空值策略、自动重算、删除标记、影响警告、依赖查看、循环引用拦截、只读保护、任务状态和重试。
+
 ## 回滚
 
 候选版本未通过验收时，继续使用旧容器和旧入口。正式切换后出现问题时，恢复升级前代码提交和 PostgreSQL 备份，再重新启动旧镜像。
