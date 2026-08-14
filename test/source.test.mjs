@@ -87,6 +87,7 @@ test("view rename, exact small column widths and table drag ordering are impleme
   for (const marker of ["GripVertical", "onReorderTables", "gridWidth", 'window.prompt("重命名视图"']) assert.equal(app.includes(marker), true, marker);
   assert.equal(styles.includes(".data-grid { min-width: 0; width: max-content"), true);
   assert.equal(styles.includes(".table-nav-item .drag-handle"), true);
+  assert.equal(styles.includes("@media (max-width: 760px)"), true);
 });
 
 test("hidden admin dialogs cannot intercept the login page", () => {

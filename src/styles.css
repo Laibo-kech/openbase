@@ -71,3 +71,37 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text); fon
 .lookup-readonly > small { color: var(--tertiary); font-weight: 400; }
 .lookup-pending { color: var(--orange); }
 .lookup-error { color: var(--red); }
+
+@media (max-width: 760px) {
+  body { min-width: 0; }
+  .topbar { gap: 8px; padding: 0 10px; }
+  .topbar > strong, .topbar .crumb, .top-actions .saved { display: none; }
+  .back-button { margin-left: 0; }
+  .top-actions { gap: 4px; }
+  .sidebar { top: 52px; right: 0; bottom: auto; width: auto; height: 58px; display: flex; align-items: center; gap: 4px; padding: 8px; overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--border); }
+  .sidebar .nav-label { display: none; }
+  .sidebar .nav-item { width: auto; flex: 0 0 auto; padding: 0 10px; }
+  .sidebar .table-nav-item .drag-handle { display: none; }
+  .workbench { left: 0; top: 110px; }
+  .content-page { left: 0; top: 110px; padding: 22px 16px; }
+  .toolbar { overflow-x: auto; }
+  .toolbar > * { flex: 0 0 auto; }
+  .toolbar-spacer { min-width: 8px; }
+  .search-box.compact { width: 180px; }
+  .drawer-wrap, .field-drawer-wrap { inset: 52px 0 0; }
+  .drawer-veil, .field-drawer-wrap .drawer-veil { display: none; }
+  .drawer, .drawer.field-drawer { width: 100%; border-left: 0; box-shadow: none; }
+  .drawer header { min-height: 72px; padding: 16px; }
+  .drawer-body { padding: 0 16px 20px; }
+  .drawer footer { min-height: 64px; padding: 12px 16px; }
+  .lookup-rules { grid-template-columns: 1fr; }
+  .lookup-rules > span { grid-column: auto; }
+  .field-drawer > footer .button { padding: 0 10px; }
+  .field-drawer > footer .button.danger:first-child { margin-right: auto; }
+  .bases-content { padding: 76px 16px 24px; }
+  .project-grid { grid-template-columns: 1fr; gap: 14px; }
+  .search-box { width: 100%; }
+  .modal { width: calc(100% - 24px); max-height: 88vh; }
+  .modal header, .modal footer { padding-left: 18px; padding-right: 18px; }
+  .modal-body { padding-left: 18px; padding-right: 18px; }
+}
