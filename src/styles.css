@@ -89,6 +89,8 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text); fon
   .toolbar-spacer { min-width: 8px; }
   .search-box.compact { width: 180px; }
   .drawer-wrap, .field-drawer-wrap { inset: 52px 0 0; }
+  body:has(.drawer-wrap) .sidebar { display: none; }
+  body:has(.drawer-wrap) .workbench { top: 52px; }
   .drawer-veil, .field-drawer-wrap .drawer-veil { display: none; }
   .drawer, .drawer.field-drawer { width: 100%; border-left: 0; box-shadow: none; }
   .drawer header { min-height: 72px; padding: 16px; }
