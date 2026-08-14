@@ -168,14 +168,14 @@ export async function enqueueLookupJob({ lookupFieldId, mode = "incremental", us
   const inserted = (await client.query(
     `INSERT INTO lookup_jobs(lookup_field_id,requested_by_user_id,requested_by,mode,total_records)
      VALUES($1,$2,$3,$4,$5)
-     ON CONFLICT(lookup_field_id) WHERE status IN ('pending','computing') DO NOTHING
+     ON CONFLICT(lookup_field_id,mode) WHERE status IN ('pending','computing') DO NOTHING
      RETURNING *`,
     [lookupFieldId, user?.id || null, user?.username || "system", mode, total],
   )).rows[0];
   if (inserted) return inserted;
   return (await client.query(
-    "SELECT * FROM lookup_jobs WHERE lookup_field_id=$1 AND status IN ('pending','computing') ORDER BY created_at DESC LIMIT 1",
-    [lookupFieldId],
+    "SELECT * FROM lookup_jobs WHERE lookup_field_id=$1 AND mode=$2 AND status IN ('pending','computing') ORDER BY created_at DESC LIMIT 1",
+    [lookupFieldId, mode],
   )).rows[0];
 }
 

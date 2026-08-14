@@ -115,7 +115,8 @@ test("lookup enhancement has stable IDs, dependencies, indexed batches and retri
     "assertNoLookupCycle",
     "batch_size integer NOT NULL DEFAULT 1000",
     "retry_failed",
-    "ON CONFLICT(lookup_field_id) WHERE status IN ('pending','computing') DO NOTHING",
+    "lookup_jobs_one_active_mode_idx",
+    "ON CONFLICT(lookup_field_id,mode) WHERE status IN ('pending','computing') DO NOTHING",
   ]) assert.equal(`${database}\n${lookup}`.includes(marker), true, marker);
   for (const marker of [
     "/record-options",

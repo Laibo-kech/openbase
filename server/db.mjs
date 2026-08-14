@@ -185,8 +185,9 @@ CREATE TABLE IF NOT EXISTS lookup_jobs (
   started_at timestamptz,
   completed_at timestamptz
 );
-CREATE UNIQUE INDEX IF NOT EXISTS lookup_jobs_one_active_field_idx
-  ON lookup_jobs(lookup_field_id) WHERE status IN ('pending','computing');
+DROP INDEX IF EXISTS lookup_jobs_one_active_field_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS lookup_jobs_one_active_mode_idx
+  ON lookup_jobs(lookup_field_id,mode) WHERE status IN ('pending','computing');
 CREATE INDEX IF NOT EXISTS lookup_jobs_status_idx ON lookup_jobs(status, created_at);
 
 CREATE TABLE IF NOT EXISTS lookup_job_failures (
