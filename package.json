@@ -10,6 +10,7 @@
     "test": "node --test test/*.test.mjs",
     "seed:million": "node scripts/seed-million.mjs",
     "acceptance": "node scripts/acceptance.mjs",
+    "acceptance:lookup": "node scripts/lookup-acceptance.mjs",
     "acceptance:admin": "node scripts/admin-acceptance.mjs",
     "acceptance:accounts": "node scripts/account-acceptance.mjs",
     "provision:users": "node scripts/provision-users.mjs"

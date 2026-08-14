@@ -10,6 +10,23 @@ import ExcelJS from "exceljs";
 import bcrypt from "bcryptjs";
 import { parse as parseCsv } from "csv-parse/sync";
 import { initializeDatabase, pool, withTransaction, writeAudit } from "./db.mjs";
+import {
+  LOOKUP_RETURN_TYPES,
+  assertNoLookupCycle,
+  enqueueDirtyLookupJobs,
+  enqueueLookupJob,
+  fieldRuntimeMetadata,
+  getFieldImpact,
+  markLookupsDirtyForSource,
+  markLookupsDirtyForTarget,
+  removeLookupDependency,
+  resolveRelationLabels,
+  resolveStoredLookups,
+  saveLookupDependency,
+  startLookupWorker,
+  syncRecordRelations,
+  validateAggregation,
+} from "./lookup-service.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.resolve(__dirname, "../dist");
@@ -189,6 +206,81 @@ async function getFields(tableId, includeDeleted = false, client = pool) {
   return rows;
 }
 
+async function normalizeFieldConfig(tableId, type, input, fieldId = null, client = pool) {
+  const config = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  if (type === "relation") {
+    const targetTableId = String(config.targetTableId || "");
+    const matchFieldId = String(config.matchFieldId || "");
+    const returnFieldId = String(config.returnFieldId || "");
+    const target = (await client.query(
+      `SELECT target.id FROM data_tables source
+       JOIN data_tables target ON target.base_id=source.base_id
+       WHERE source.id=$1 AND target.id=$2 AND source.deleted_at IS NULL AND target.deleted_at IS NULL`,
+      [tableId, targetTableId],
+    )).rows[0];
+    if (!target) throw httpError(400, "目标数据表不存在或不属于当前项目", "RELATION_TARGET_TABLE_INVALID");
+    const targetFields = (await client.query(
+      `SELECT id,type FROM fields WHERE table_id=$1 AND id=ANY($2::uuid[]) AND deleted_at IS NULL`,
+      [targetTableId, [matchFieldId, returnFieldId]],
+    )).rows;
+    if (!targetFields.some((item) => item.id === matchFieldId)) {
+      throw httpError(400, "请选择有效的匹配字段", "RELATION_MATCH_FIELD_INVALID");
+    }
+    if (!targetFields.some((item) => item.id === returnFieldId)) {
+      throw httpError(400, "请选择有效的返回字段", "RELATION_RETURN_FIELD_INVALID");
+    }
+    return { targetTableId, matchFieldId, returnFieldId, multiple: config.multiple !== false };
+  }
+  if (type === "lookup") {
+    const relationFieldId = String(config.relationFieldId || "");
+    const targetFieldId = String(config.targetFieldId || "");
+    const aggregation = String(config.aggregation || "first");
+    const relation = (await client.query(
+      "SELECT id,config FROM fields WHERE id=$1 AND table_id=$2 AND type='relation' AND deleted_at IS NULL",
+      [relationFieldId, tableId],
+    )).rows[0];
+    if (!relation) throw httpError(400, "请先选择当前数据表中的关联字段", "LOOKUP_RELATION_INVALID");
+    const targetTableId = relation.config?.targetTableId;
+    const target = (await client.query(
+      "SELECT id,type FROM fields WHERE id=$1 AND table_id=$2 AND deleted_at IS NULL",
+      [targetFieldId, targetTableId],
+    )).rows[0];
+    if (!target || !LOOKUP_RETURN_TYPES.has(target.type)) {
+      throw httpError(400, "返回字段只支持文本、数字、日期和单选", "LOOKUP_TARGET_FIELD_INVALID");
+    }
+    try {
+      validateAggregation(target.type, aggregation);
+      await assertNoLookupCycle(client, tableId, targetTableId, fieldId);
+    } catch (error) {
+      throw httpError(409, error.message, error.code || "LOOKUP_CONFIG_INVALID");
+    }
+    const emptyPolicy = ["empty", "default", "unmatched"].includes(config.emptyPolicy)
+      ? config.emptyPolicy
+      : "empty";
+    return {
+      relationFieldId,
+      targetFieldId,
+      targetTableId,
+      returnType: target.type,
+      aggregation,
+      emptyPolicy,
+      defaultValue: emptyPolicy === "default" ? config.defaultValue ?? "" : null,
+      separator: String(config.separator || "、").slice(0, 8),
+    };
+  }
+  if (type === "text") return { multiline: Boolean(config.multiline) };
+  if (type === "number") return {
+    decimals: Math.max(0, Math.min(8, Number(config.decimals ?? 2))),
+    currency: config.currency === "CNY" ? "CNY" : null,
+  };
+  if (type === "date") return { includeTime: Boolean(config.includeTime) };
+  if (type === "select") {
+    const options = Array.isArray(config.options) ? config.options.slice(0, 500) : [];
+    return { options: options.map((item) => ({ label: String(item?.label || item).trim() })).filter((item) => item.label) };
+  }
+  return {};
+}
+
 function normalizeValue(field, value) {
   if (value === null || value === undefined || value === "") return null;
   if (field.type === "text") return String(value);
@@ -208,7 +300,7 @@ function normalizeValue(field, value) {
     return String(value);
   }
   if (field.type === "relation") {
-    const ids = Array.isArray(value) ? value : [value];
+    const ids = Array.isArray(value) ? value : String(value).split(/[,;，；]/).map((item) => item.trim()).filter(Boolean);
     if (!ids.every((id) => /^\d+$/.test(String(id)))) throw httpError(400, `字段“${field.name}”关联记录无效`, "FIELD_VALUE_INVALID");
     return ids.map(String);
   }
@@ -222,33 +314,17 @@ async function validateValues(tableId, input, client = pool) {
   for (const [fieldId, value] of Object.entries(input || {})) {
     const field = byId.get(fieldId);
     if (!field) throw httpError(400, "包含不存在或已删除的字段", "FIELD_NOT_FOUND");
-    if (field.type === "lookup") continue;
+    if (field.type === "lookup") {
+      throw httpError(400, `字段“${field.name}”是只读查找引用结果，不能直接修改`, "LOOKUP_READ_ONLY");
+    }
     output[fieldId] = normalizeValue(field, value);
   }
   return output;
 }
 
 async function resolveLookups(tableId, records, fields) {
-  const lookupFields = fields.filter((field) => field.type === "lookup");
-  if (!lookupFields.length || !records.length) return records;
-  for (const lookup of lookupFields) {
-    const { relationFieldId, targetFieldId, aggregation = "first" } = lookup.config || {};
-    const relation = fields.find((field) => field.id === relationFieldId && field.type === "relation");
-    if (!relation?.config?.targetTableId || !targetFieldId) continue;
-    const ids = [...new Set(records.flatMap((record) => record.values?.[relationFieldId] || []).map(String))];
-    if (!ids.length) continue;
-    const { rows } = await pool.query(
-      "SELECT id,values FROM records WHERE table_id=$1 AND id = ANY($2::bigint[]) AND deleted_at IS NULL",
-      [relation.config.targetTableId, ids],
-    );
-    const byId = new Map(rows.map((row) => [String(row.id), row.values?.[targetFieldId]]));
-    for (const record of records) {
-      const values = (record.values?.[relationFieldId] || []).map((id) => byId.get(String(id))).filter((value) => value !== undefined && value !== null);
-      if (aggregation === "sum") record.values[lookup.id] = values.reduce((sum, value) => sum + Number(value || 0), 0);
-      else if (aggregation === "count") record.values[lookup.id] = values.length;
-      else record.values[lookup.id] = values[0] ?? null;
-    }
-  }
+  await resolveRelationLabels(records, fields);
+  await resolveStoredLookups(records, fields);
   return records;
 }
 
@@ -428,8 +504,42 @@ app.get("/api/tables/:tableId/schema", async (req, res, next) => {
     const table = (await pool.query(`SELECT t.*,b.name base_name FROM data_tables t JOIN bases b ON b.id=t.base_id WHERE t.id=$1 AND t.deleted_at IS NULL`, [req.params.tableId])).rows[0];
     if (!table) throw httpError(404, "数据表不存在", "TABLE_NOT_FOUND");
     const fields = await getFields(req.params.tableId);
+    const runtime = await fieldRuntimeMetadata(req.params.tableId);
+    for (const field of fields) {
+      field.dependency = runtime.dependencies.get(field.id) || null;
+      field.calculation = runtime.jobs.get(field.id) || null;
+    }
     const views = (await pool.query("SELECT * FROM views WHERE table_id=$1 ORDER BY created_at", [req.params.tableId])).rows;
     res.json({ table, fields, views });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/tables/:tableId/record-options", async (req, res, next) => {
+  try {
+    const matchFieldId = String(req.query.matchFieldId || "");
+    const returnFieldId = String(req.query.returnFieldId || matchFieldId);
+    const fields = await getFields(req.params.tableId);
+    if (!fields.some((field) => field.id === matchFieldId) || !fields.some((field) => field.id === returnFieldId)) {
+      throw httpError(400, "匹配字段或返回字段无效", "RELATION_OPTION_FIELDS_INVALID");
+    }
+    const search = String(req.query.search || "").trim().slice(0, 100);
+    const params = [req.params.tableId, matchFieldId, returnFieldId];
+    let clause = "";
+    if (search) {
+      params.push(search);
+      clause = "AND COALESCE(values->>$2,'') ILIKE '%' || $4 || '%'";
+    }
+    const { rows } = await pool.query(
+      `SELECT id,values->>$2 match_value,values->>$3 return_value
+       FROM records WHERE table_id=$1 AND deleted_at IS NULL ${clause}
+       ORDER BY id DESC LIMIT 50`,
+      params,
+    );
+    res.json(rows.map((row) => ({
+      id: String(row.id),
+      matchValue: row.match_value ?? `记录 #${row.id}`,
+      label: row.return_value ?? row.match_value ?? `记录 #${row.id}`,
+    })));
   } catch (error) { next(error); }
 });
 
@@ -486,36 +596,120 @@ app.post("/api/tables/:tableId/fields", async (req, res, next) => {
     const type = String(req.body?.type || "");
     if (!name || !["text","number","date","select","relation","lookup"].includes(type)) throw httpError(400, "字段名称或类型无效", "FIELD_INVALID");
     const row = await withTransaction(async (client) => {
+      const config = await normalizeFieldConfig(req.params.tableId, type, req.body?.config, null, client);
       const position = (await client.query("SELECT COALESCE(max(position),-1)+1 value FROM fields WHERE table_id=$1", [req.params.tableId])).rows[0].value;
       const field = (await client.query(
         "INSERT INTO fields(table_id,name,type,config,position) VALUES($1,$2,$3,$4::jsonb,$5) RETURNING *",
-        [req.params.tableId,name,type,JSON.stringify(req.body?.config || {}),position],
+        [req.params.tableId,name,type,JSON.stringify(config),position],
       )).rows[0];
+      if (type === "lookup") await saveLookupDependency(client, field);
       await writeAudit({ actor: req.user.username, action: "create", objectType: "field", objectId: field.id, details: { type }, ip: req.ip }, client);
       return field;
     });
+    if (type === "lookup") row.calculation = await enqueueLookupJob({ lookupFieldId: row.id, mode: "full", user: req.user });
     res.status(201).json(row);
   } catch (error) { next(error); }
 });
 
 app.patch("/api/fields/:fieldId", async (req, res, next) => {
   try {
-    const { rows } = await pool.query(
-      "UPDATE fields SET name=COALESCE($2,name),config=COALESCE($3::jsonb,config),updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING *",
-      [req.params.fieldId, req.body?.name || null, req.body?.config ? JSON.stringify(req.body.config) : null],
+    const current = (await pool.query("SELECT * FROM fields WHERE id=$1 AND deleted_at IS NULL", [req.params.fieldId])).rows[0];
+    if (!current) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
+    const type = req.body?.type === undefined ? current.type : String(req.body.type);
+    if (!["text","number","date","select","relation","lookup"].includes(type)) throw httpError(400, "字段类型无效", "FIELD_TYPE_INVALID");
+    if (type !== current.type && ["relation", "lookup"].includes(current.type)) {
+      throw httpError(409, "关联记录和查找引用字段不能直接修改为其他类型，请新建字段后迁移", "RELATIONAL_TYPE_LOCKED");
+    }
+    const impact = await getFieldImpact(req.params.fieldId);
+    if (type !== current.type && impact.affectedFields && req.body?.confirmImpact !== true) {
+      throw Object.assign(
+        httpError(409, "修改字段类型会影响现有查找引用，请确认影响范围", "FIELD_IMPACT_CONFIRMATION_REQUIRED"),
+        { details: impact },
+      );
+    }
+    if (type !== current.type && impact.affectedFields) {
+      const dependents = await pool.query(
+        `SELECT f.name,f.config FROM lookup_dependencies d JOIN fields f ON f.id=d.lookup_field_id
+         WHERE d.target_field_id=$1 AND f.deleted_at IS NULL`,
+        [req.params.fieldId],
+      );
+      for (const dependent of dependents.rows) {
+        try { validateAggregation(type, dependent.config?.aggregation || "first"); }
+        catch { throw httpError(409, `字段“${dependent.name}”的汇总方式与新类型不兼容，请先调整查找引用`, "LOOKUP_AGGREGATION_INCOMPATIBLE"); }
+      }
+    }
+    const row = await withTransaction(async (client) => {
+      const configInput = req.body?.config === undefined ? current.config : req.body.config;
+      const config = await normalizeFieldConfig(current.table_id, type, configInput, current.id, client);
+      const updated = (await client.query(
+        "UPDATE fields SET name=COALESCE($2,name),type=$3,config=$4::jsonb,updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING *",
+        [req.params.fieldId, req.body?.name || null, type, JSON.stringify(config)],
+      )).rows[0];
+      if (type === "lookup") await saveLookupDependency(client, updated);
+      else await removeLookupDependency(client, updated.id);
+      await writeAudit({ actor: req.user.username, action: "update", objectType: "field", objectId: req.params.fieldId, details: { previousType: current.type, type }, ip: req.ip }, client);
+      return updated;
+    });
+    if (type === "lookup") row.calculation = await enqueueLookupJob({ lookupFieldId: row.id, mode: "full", user: req.user });
+    if (type !== current.type && impact.affectedFields) {
+      for (const dependent of impact.dependents) {
+        await enqueueLookupJob({ lookupFieldId: dependent.lookup_field_id, mode: "full", user: req.user });
+      }
+    }
+    res.json(row);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/fields/:fieldId/impact", async (req, res, next) => {
+  try { res.json(await getFieldImpact(req.params.fieldId)); }
+  catch (error) { next(error); }
+});
+
+app.get("/api/fields/:fieldId/dependencies", async (req, res, next) => {
+  try {
+    const field = (await pool.query("SELECT table_id,type FROM fields WHERE id=$1 AND deleted_at IS NULL", [req.params.fieldId])).rows[0];
+    if (!field) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
+    const runtime = await fieldRuntimeMetadata(field.table_id);
+    const failures = await pool.query(
+      `SELECT source_record_id,error_code,error_message,created_at FROM lookup_job_failures
+       WHERE lookup_field_id=$1 ORDER BY created_at DESC LIMIT 100`,
+      [req.params.fieldId],
     );
-    if (!rows.length) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
-    await writeAudit({ actor: req.user.username, action: "update", objectType: "field", objectId: req.params.fieldId, ip: req.ip });
-    res.json(rows[0]);
+    res.json({ dependency: runtime.dependencies.get(req.params.fieldId) || null, calculation: runtime.jobs.get(req.params.fieldId) || null, failures: failures.rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/fields/:fieldId/recalculate", async (req, res, next) => {
+  try {
+    const field = (await pool.query("SELECT type FROM fields WHERE id=$1 AND deleted_at IS NULL", [req.params.fieldId])).rows[0];
+    if (!field) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
+    if (field.type !== "lookup") throw httpError(400, "只有查找引用字段可以重新计算", "FIELD_NOT_LOOKUP");
+    const mode = req.body?.retryFailed ? "retry_failed" : "full";
+    const job = await enqueueLookupJob({ lookupFieldId: req.params.fieldId, mode, user: req.user });
+    res.status(202).json(job);
   } catch (error) { next(error); }
 });
 
 app.delete("/api/fields/:fieldId", async (req, res, next) => {
   try {
-    const dependents = await pool.query("SELECT id,name FROM fields WHERE type='lookup' AND deleted_at IS NULL AND (config->>'relationFieldId'=$1 OR config->>'targetFieldId'=$1)", [req.params.fieldId]);
-    if (dependents.rows.length) throw httpError(409, `字段仍被“${dependents.rows[0].name}”引用`, "FIELD_IN_USE");
+    const impact = await getFieldImpact(req.params.fieldId);
+    if (impact.affectedFields && req.query.confirmImpact !== "true") {
+      throw Object.assign(
+        httpError(409, "删除字段会导致现有查找引用失效，请确认影响范围", "FIELD_IMPACT_CONFIRMATION_REQUIRED"),
+        { details: impact },
+      );
+    }
     const { rows } = await pool.query("UPDATE fields SET deleted_at=now(),updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING *", [req.params.fieldId]);
     if (!rows.length) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
+    if (rows[0].type === "lookup") await removeLookupDependency(pool, rows[0].id);
+    if (impact.affectedFields) {
+      await pool.query(
+        `UPDATE lookup_values SET status='failed',value=NULL,error_code='LOOKUP_DEPENDENCY_DELETED',
+         error_message='目标字段或关联字段已删除',updated_at=now()
+         WHERE lookup_field_id=ANY($1::uuid[])`,
+        [impact.dependents.map((item) => item.lookup_field_id)],
+      );
+    }
     await writeAudit({ actor: req.user.username, action: "delete", objectType: "field", objectId: req.params.fieldId, ip: req.ip });
     res.status(204).end();
   } catch (error) { next(error); }
@@ -546,10 +740,17 @@ app.get("/api/tables/:tableId/records", async (req, res, next) => {
 
 app.post("/api/tables/:tableId/records", async (req, res, next) => {
   try {
-    const values = await validateValues(req.params.tableId, req.body?.values || {});
-    const { rows } = await pool.query("INSERT INTO records(table_id,values) VALUES($1,$2::jsonb) RETURNING *", [req.params.tableId,JSON.stringify(values)]);
-    await writeAudit({ actor: req.user.username, action: "create", objectType: "record", objectId: rows[0].id, details: { tableId: req.params.tableId }, ip: req.ip });
-    res.status(201).json(rows[0]);
+    const row = await withTransaction(async (client) => {
+      const fields = await getFields(req.params.tableId, false, client);
+      const values = await validateValues(req.params.tableId, req.body?.values || {}, client);
+      const record = (await client.query("INSERT INTO records(table_id,values) VALUES($1,$2::jsonb) RETURNING *", [req.params.tableId,JSON.stringify(values)])).rows[0];
+      await syncRecordRelations(client, { recordId: record.id, tableId: req.params.tableId, values, fields });
+      const dirty = await markLookupsDirtyForSource(client, req.params.tableId, [record.id], "source_created");
+      await enqueueDirtyLookupJobs(client, dirty, req.user);
+      await writeAudit({ actor: req.user.username, action: "create", objectType: "record", objectId: record.id, details: { tableId: req.params.tableId }, ip: req.ip }, client);
+      return record;
+    });
+    res.status(201).json(row);
   } catch (error) { next(error); }
 });
 
@@ -558,10 +759,16 @@ app.post("/api/tables/:tableId/records/bulk", async (req, res, next) => {
     const input = Array.isArray(req.body?.records) ? req.body.records : [];
     if (!input.length || input.length > 5000) throw httpError(400, "每批必须包含 1–5000 条记录", "BULK_SIZE_INVALID");
     const result = await withTransaction(async (client) => {
+      const fields = await getFields(req.params.tableId, false, client);
       const normalized = [];
       for (const item of input) normalized.push(await validateValues(req.params.tableId, item.values || item, client));
       const values = normalized.map((_, index) => `($1,$${index + 2}::jsonb)`).join(",");
       const rows = (await client.query(`INSERT INTO records(table_id,values) VALUES ${values} RETURNING id`, [req.params.tableId,...normalized.map(JSON.stringify)])).rows;
+      for (const [index, row] of rows.entries()) {
+        await syncRecordRelations(client, { recordId: row.id, tableId: req.params.tableId, values: normalized[index], fields });
+      }
+      const dirty = await markLookupsDirtyForSource(client, req.params.tableId, rows.map((row) => row.id), "source_bulk_created");
+      await enqueueDirtyLookupJobs(client, dirty, req.user);
       await writeAudit({ actor: req.user.username, action: "bulk_create", objectType: "record", details: { tableId: req.params.tableId, count: rows.length }, ip: req.ip }, client);
       return rows;
     });
@@ -571,25 +778,37 @@ app.post("/api/tables/:tableId/records/bulk", async (req, res, next) => {
 
 app.patch("/api/records/:recordId", async (req, res, next) => {
   try {
-    const current = (await pool.query("SELECT * FROM records WHERE id=$1 AND deleted_at IS NULL", [req.params.recordId])).rows[0];
-    if (!current) throw httpError(404, "记录不存在", "RECORD_NOT_FOUND");
-    const patch = await validateValues(current.table_id, req.body?.values || {});
-    const expectedVersion = Number(req.body?.version || current.version);
-    const { rows } = await pool.query(
-      "UPDATE records SET values=values || $2::jsonb,version=version+1,updated_at=now() WHERE id=$1 AND version=$3 AND deleted_at IS NULL RETURNING *",
-      [req.params.recordId,JSON.stringify(patch),expectedVersion],
-    );
-    if (!rows.length) throw httpError(409, "记录已被其他操作修改，请刷新后重试", "VERSION_CONFLICT");
-    await writeAudit({ actor: req.user.username, action: "update", objectType: "record", objectId: req.params.recordId, ip: req.ip });
-    res.json(rows[0]);
+    const row = await withTransaction(async (client) => {
+      const current = (await client.query("SELECT * FROM records WHERE id=$1 AND deleted_at IS NULL FOR UPDATE", [req.params.recordId])).rows[0];
+      if (!current) throw httpError(404, "记录不存在", "RECORD_NOT_FOUND");
+      const fields = await getFields(current.table_id, false, client);
+      const patch = await validateValues(current.table_id, req.body?.values || {}, client);
+      const expectedVersion = Number(req.body?.version || current.version);
+      const rows = (await client.query(
+        "UPDATE records SET values=values || $2::jsonb,version=version+1,updated_at=now() WHERE id=$1 AND version=$3 AND deleted_at IS NULL RETURNING *",
+        [req.params.recordId,JSON.stringify(patch),expectedVersion],
+      )).rows;
+      if (!rows.length) throw httpError(409, "记录已被其他操作修改，请刷新后重试", "VERSION_CONFLICT");
+      await syncRecordRelations(client, { recordId: current.id, tableId: current.table_id, values: patch, fields });
+      const sourceDirty = await markLookupsDirtyForSource(client, current.table_id, [current.id], "source_changed");
+      const targetDirty = await markLookupsDirtyForTarget(client, current.table_id, [current.id], "target_changed");
+      await enqueueDirtyLookupJobs(client, [...new Set([...sourceDirty, ...targetDirty])], req.user);
+      await writeAudit({ actor: req.user.username, action: "update", objectType: "record", objectId: req.params.recordId, ip: req.ip }, client);
+      return rows[0];
+    });
+    res.json(row);
   } catch (error) { next(error); }
 });
 
 app.delete("/api/records/:recordId", async (req, res, next) => {
   try {
-    const { rows } = await pool.query("UPDATE records SET deleted_at=now(),updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING id,table_id", [req.params.recordId]);
-    if (!rows.length) throw httpError(404, "记录不存在", "RECORD_NOT_FOUND");
-    await writeAudit({ actor: req.user.username, action: "delete", objectType: "record", objectId: req.params.recordId, details: { tableId: rows[0].table_id }, ip: req.ip });
+    await withTransaction(async (client) => {
+      const { rows } = await client.query("UPDATE records SET deleted_at=now(),updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING id,table_id", [req.params.recordId]);
+      if (!rows.length) throw httpError(404, "记录不存在", "RECORD_NOT_FOUND");
+      const dirty = await markLookupsDirtyForTarget(client, rows[0].table_id, [rows[0].id], "target_deleted");
+      await enqueueDirtyLookupJobs(client, dirty, req.user);
+      await writeAudit({ actor: req.user.username, action: "delete", objectType: "record", objectId: req.params.recordId, details: { tableId: rows[0].table_id }, ip: req.ip }, client);
+    });
     res.status(204).end();
   } catch (error) { next(error); }
 });
@@ -690,6 +909,7 @@ app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, 
     const job = (await pool.query("INSERT INTO import_jobs(table_id,filename,status,total_rows) VALUES($1,$2,'validating',$3) RETURNING *", [req.params.tableId,req.file.originalname,sourceRows.length])).rows[0];
     let success = 0; const errors = [];
     await withTransaction(async (client) => {
+      const insertedIds = [];
       for (let offset = 0; offset < sourceRows.length; offset += 500) {
         const batch = [];
         for (let index = offset; index < Math.min(offset + 500, sourceRows.length); index += 1) {
@@ -704,10 +924,19 @@ app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, 
         }
         if (batch.length) {
           const placeholders = batch.map((_, index) => `($1,$${index + 2}::jsonb)`).join(",");
-          await client.query(`INSERT INTO records(table_id,values) VALUES ${placeholders}`, [req.params.tableId,...batch.map(JSON.stringify)]);
+          const inserted = (await client.query(
+            `INSERT INTO records(table_id,values) VALUES ${placeholders} RETURNING id`,
+            [req.params.tableId,...batch.map(JSON.stringify)],
+          )).rows;
+          for (const [index, row] of inserted.entries()) {
+            await syncRecordRelations(client, { recordId: row.id, tableId: req.params.tableId, values: batch[index], fields });
+            insertedIds.push(row.id);
+          }
           success += batch.length;
         }
       }
+      const dirty = await markLookupsDirtyForSource(client, req.params.tableId, insertedIds, "source_imported");
+      await enqueueDirtyLookupJobs(client, dirty, req.user);
       await client.query("UPDATE import_jobs SET status=$2,success_rows=$3,error_rows=$4,details=$5::jsonb,completed_at=now() WHERE id=$1", [job.id, errors.length ? "completed_with_errors" : "completed", success, errors.length, JSON.stringify({ errors: errors.slice(0,200) })]);
       await writeAudit({ actor: req.user.username, action: "import", objectType: "import_job", objectId: job.id, details: { total: sourceRows.length, success, errors: errors.length, importId: parsed.importId || null }, ip: req.ip }, client);
     });
@@ -840,10 +1069,21 @@ app.post("/api/recycle-bin/:type/:id/restore", async (req, res, next) => {
   try {
     const table = req.params.type === "field" ? "fields" : req.params.type === "record" ? "records" : null;
     if (!table) throw httpError(400, "回收站类型无效", "RECYCLE_TYPE_INVALID");
-    const { rows } = await pool.query(`UPDATE ${table} SET deleted_at=NULL,updated_at=now() WHERE id=$1 AND deleted_at IS NOT NULL RETURNING id`, [req.params.id]);
-    if (!rows.length) throw httpError(404, "回收站项目不存在", "RECYCLE_NOT_FOUND");
-    await writeAudit({ actor: req.user.username, action: "restore", objectType: req.params.type, objectId: req.params.id, ip: req.ip });
-    res.json(rows[0]);
+    const row = await withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `UPDATE ${table} SET deleted_at=NULL,updated_at=now() WHERE id=$1 AND deleted_at IS NOT NULL RETURNING *`,
+        [req.params.id],
+      );
+      if (!rows.length) throw httpError(404, "回收站项目不存在", "RECYCLE_NOT_FOUND");
+      if (req.params.type === "record") {
+        const sourceDirty = await markLookupsDirtyForSource(client, rows[0].table_id, [rows[0].id], "source_restored");
+        const targetDirty = await markLookupsDirtyForTarget(client, rows[0].table_id, [rows[0].id], "target_restored");
+        await enqueueDirtyLookupJobs(client, [...new Set([...sourceDirty, ...targetDirty])], req.user);
+      }
+      await writeAudit({ actor: req.user.username, action: "restore", objectType: req.params.type, objectId: req.params.id, ip: req.ip }, client);
+      return rows[0];
+    });
+    res.json(row);
   } catch (error) { next(error); }
 });
 
@@ -879,10 +1119,15 @@ app.use((error, _req, res, _next) => {
   if (error.code === "23505") return res.status(409).json({ error: "同一位置已存在相同名称", code: "NAME_CONFLICT" });
   const status = error.status || 500;
   if (status >= 500) console.error(error);
-  res.status(status).json({ error: error.status ? error.message : "服务器暂时无法处理请求", code: error.code || "INTERNAL_ERROR" });
+  res.status(status).json({
+    error: error.status ? error.message : "服务器暂时无法处理请求",
+    code: error.code || "INTERNAL_ERROR",
+    ...(error.details ? { details: error.details } : {}),
+  });
 });
 
 await initializeDatabase();
+await startLookupWorker();
 const server = app.listen(port, "0.0.0.0", () => console.log(`multibase-v1 listening on ${port}`));
 
 async function shutdown(signal) {

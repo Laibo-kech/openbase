@@ -21,6 +21,7 @@ export async function api(path, options = {}) {
     const error = new Error(result?.error || `请求失败 (${response.status})`);
     error.status = response.status;
     error.code = result?.code;
+    error.details = result?.details;
     throw error;
   }
   return result;

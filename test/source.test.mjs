@@ -93,3 +93,44 @@ test("hidden admin dialogs cannot intercept the login page", () => {
   const styles = fs.readFileSync(new URL("../admin/admin.css", import.meta.url), "utf8");
   assert.equal(styles.includes("[hidden] { display: none !important; }"), true);
 });
+
+test("lookup enhancement has stable IDs, dependencies, indexed batches and retries", () => {
+  const database = fs.readFileSync(new URL("../server/db.mjs", import.meta.url), "utf8");
+  const server = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8");
+  const lookup = fs.readFileSync(new URL("../server/lookup-service.mjs", import.meta.url), "utf8");
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  for (const marker of [
+    "CREATE TABLE IF NOT EXISTS record_relations",
+    "record_relations_target_idx",
+    "CREATE TABLE IF NOT EXISTS lookup_dependencies",
+    "CREATE TABLE IF NOT EXISTS lookup_values",
+    "CREATE TABLE IF NOT EXISTS lookup_jobs",
+    "CREATE TABLE IF NOT EXISTS lookup_job_failures",
+  ]) assert.equal(database.includes(marker), true, marker);
+  for (const marker of [
+    "syncRecordRelations",
+    "markLookupsDirtyForSource",
+    "markLookupsDirtyForTarget",
+    "assertNoLookupCycle",
+    "batch_size integer NOT NULL DEFAULT 1000",
+    "retry_failed",
+  ]) assert.equal(`${database}\n${lookup}`.includes(marker), true, marker);
+  for (const marker of [
+    "/record-options",
+    "/dependencies",
+    "/recalculate",
+    "FIELD_IMPACT_CONFIRMATION_REQUIRED",
+    "confirmImpact=true",
+    "LOOKUP_READ_ONLY",
+  ]) assert.equal(`${server}\n${app}`.includes(marker), true, marker);
+  for (const marker of [
+    "目标数据表",
+    "匹配字段",
+    "返回字段",
+    "去重拼接",
+    "显示未匹配",
+    "重新计算",
+    "重试失败记录",
+    "只读结果，请修改关联记录或来源数据",
+  ]) assert.equal(app.includes(marker), true, marker);
+});

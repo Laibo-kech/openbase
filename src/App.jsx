@@ -588,10 +588,15 @@ function Sidebar({
   );
 }
 
-function CellValue({ field, value }) {
-  if (value === null || value === undefined || value === "")
-    return <span className="muted">—</span>;
-  if (field.type === "number") return <>¥ {formatNumber(value)}</>;
+function CellValue({ field, value, relationLabels, lookupStatus }) {
+  if (field.type === "lookup" && lookupStatus?.status && lookupStatus.status !== "completed") {
+    if (lookupStatus.status === "failed") {
+      return <span className="lookup-error" title={lookupStatus.error_message || "计算失败"}>计算失败</span>;
+    }
+    return <span className="lookup-pending">{lookupStatus.status === "computing" ? "计算中" : "待计算"}</span>;
+  }
+  if (value === null || value === undefined || value === "") return <span className="muted">—</span>;
+  if (field.type === "number") return <>{field.config?.currency === "CNY" ? "¥ " : ""}{formatNumber(value)}</>;
   if (field.type === "select")
     return (
       <span
@@ -600,8 +605,15 @@ function CellValue({ field, value }) {
         {value}
       </span>
     );
-  if (field.type === "relation")
-    return <span>{Array.isArray(value) ? `${value.length} 条` : value}</span>;
+  if (field.type === "relation") {
+    const labels = relationLabels || [];
+    if (!labels.length) return <span className="muted">—</span>;
+    return <span title={labels.map((item) => item.label).join("、")}>{labels.map((item) => item.label).join("、")}</span>;
+  }
+  if (field.type === "lookup" && field.config?.returnType === "number" && typeof value === "number") {
+    return <>{formatNumber(value)}</>;
+  }
+  if (Array.isArray(value)) return <>{value.join("、")}</>;
   return <>{String(value)}</>;
 }
 
@@ -609,16 +621,47 @@ function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
   const [name, setName] = useState(field?.name || "");
   const [type, setType] = useState(field?.type || "text");
   const [config, setConfig] = useState(field?.config || {});
+  const [targetSchema, setTargetSchema] = useState(null);
+  const [runtime, setRuntime] = useState(field ? { dependency: field.dependency, calculation: field.calculation, failures: [] } : null);
+  const [impact, setImpact] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  async function save() {
+  const relationField = fields.find((item) => item.id === config.relationFieldId && item.type === "relation");
+  const targetTableId = type === "relation" ? config.targetTableId : relationField?.config?.targetTableId;
+
+  useEffect(() => {
+    let active = true;
+    if (!targetTableId) {
+      setTargetSchema(null);
+      return () => { active = false; };
+    }
+    api(`/tables/${targetTableId}/schema`).then((result) => {
+      if (active) setTargetSchema(result);
+    }).catch((err) => {
+      if (active) setError(err.message);
+    });
+    return () => { active = false; };
+  }, [targetTableId]);
+
+  useEffect(() => {
+    if (!field || type !== "lookup") return undefined;
+    let active = true;
+    const load = () => api(`/fields/${field.id}/dependencies`).then((result) => {
+      if (active) setRuntime(result);
+    }).catch(() => {});
+    load();
+    const timer = setInterval(load, 1500);
+    return () => { active = false; clearInterval(timer); };
+  }, [field?.id, type]);
+
+  async function save(confirmImpact = false) {
     setSaving(true);
     setError("");
     try {
       if (field)
         await api(`/fields/${field.id}`, {
           method: "PATCH",
-          body: { name, config },
+          body: { name, type, config, confirmImpact },
         });
       else
         await api(`/tables/${tableId}/fields`, {
@@ -627,10 +670,38 @@ function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
         });
       onSaved();
     } catch (err) {
-      setError(err.message);
+      if (err.code === "FIELD_IMPACT_CONFIRMATION_REQUIRED") {
+        setImpact({ operation: "save", details: err.details });
+      } else setError(err.message);
     } finally {
       setSaving(false);
     }
+  }
+  async function removeField(confirmImpact = false) {
+    setSaving(true);
+    setError("");
+    try {
+      await api(`/fields/${field.id}${confirmImpact ? "?confirmImpact=true" : ""}`, { method: "DELETE" });
+      onSaved();
+    } catch (err) {
+      if (err.code === "FIELD_IMPACT_CONFIRMATION_REQUIRED") {
+        setImpact({ operation: "delete", details: err.details });
+      } else setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function recalculate(retryFailed = false) {
+    setSaving(true);
+    setError("");
+    try {
+      const calculation = await api(`/fields/${field.id}/recalculate`, {
+        method: "POST",
+        body: { retryFailed },
+      });
+      setRuntime((current) => ({ ...(current || {}), calculation }));
+    } catch (err) { setError(err.message); }
+    finally { setSaving(false); }
   }
   function setOptions(text) {
     setConfig({
@@ -643,9 +714,9 @@ function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
     });
   }
   return (
-    <div className="drawer-wrap">
+    <div className="drawer-wrap field-drawer-wrap">
       <button className="drawer-veil" onClick={onClose} aria-label="关闭" />
-      <aside className="drawer">
+      <aside className="drawer field-drawer">
         <header>
           <div>
             <h2>配置字段</h2>
@@ -668,7 +739,7 @@ function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
             字段类型
             <select
               value={type}
-              disabled={Boolean(field)}
+              disabled={Boolean(field && ["relation", "lookup"].includes(field.type))}
               onChange={(event) => {
                 setType(event.target.value);
                 setConfig({});
@@ -750,34 +821,53 @@ function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
             </label>
           )}
           {type === "relation" && (
-            <label>
-              关联数据表
-              <select
-                value={config.targetTableId || ""}
-                onChange={(event) =>
-                  setConfig({ ...config, targetTableId: event.target.value })
-                }
-              >
-                <option value="">请选择</option>
-                {tables.map((table) => (
-                  <option key={table.id} value={table.id}>
-                    {table.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="field-steps">
+              <label className="field-step">
+                <span><b>1</b>目标数据表</span>
+                <select
+                  value={config.targetTableId || ""}
+                  onChange={(event) => setConfig({ targetTableId: event.target.value, matchFieldId: "", returnFieldId: "", multiple: config.multiple !== false })}
+                >
+                  <option value="">请选择</option>
+                  {tables.map((table) => <option key={table.id} value={table.id}>{table.name}</option>)}
+                </select>
+              </label>
+              <label className="field-step">
+                <span><b>2</b>匹配字段</span>
+                <select
+                  value={config.matchFieldId || ""}
+                  disabled={!targetSchema}
+                  onChange={(event) => setConfig({ ...config, matchFieldId: event.target.value })}
+                >
+                  <option value="">请选择用于搜索和匹配的字段</option>
+                  {(targetSchema?.fields || []).filter((item) => item.type !== "lookup" && item.type !== "relation").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </select>
+              </label>
+              <label className="field-step">
+                <span><b>3</b>返回字段</span>
+                <select
+                  value={config.returnFieldId || ""}
+                  disabled={!targetSchema}
+                  onChange={(event) => setConfig({ ...config, returnFieldId: event.target.value })}
+                >
+                  <option value="">请选择关联后显示的字段</option>
+                  {(targetSchema?.fields || []).filter((item) => item.type !== "lookup" && item.type !== "relation").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </select>
+              </label>
+              <label className="check relation-multiple">
+                <input type="checkbox" checked={config.multiple !== false} onChange={(event) => setConfig({ ...config, multiple: event.target.checked })} />
+                允许一条记录关联多条目标记录
+              </label>
+            </div>
           )}
           {type === "lookup" && (
-            <>
-              <label>
-                通过关联字段
+            <div className="field-steps">
+              <label className="field-step">
+                <span><b>1</b>关联字段</span>
                 <select
                   value={config.relationFieldId || ""}
                   onChange={(event) =>
-                    setConfig({
-                      ...config,
-                      relationFieldId: event.target.value,
-                    })
+                    setConfig({ relationFieldId: event.target.value, targetFieldId: "", aggregation: "first", emptyPolicy: "empty" })
                   }
                 >
                   <option value="">请选择</option>
@@ -790,39 +880,111 @@ function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
                     ))}
                 </select>
               </label>
-              <label>
-                目标字段 ID
-                <input
-                  value={config.targetFieldId || ""}
-                  onChange={(event) =>
-                    setConfig({ ...config, targetFieldId: event.target.value })
-                  }
-                />
-              </label>
-              <label>
-                聚合方式
+              <label className="field-step">
+                <span><b>2</b>返回字段</span>
                 <select
-                  value={config.aggregation || "first"}
-                  onChange={(event) =>
-                    setConfig({ ...config, aggregation: event.target.value })
-                  }
+                  value={config.targetFieldId || ""}
+                  disabled={!targetSchema}
+                  onChange={(event) => setConfig({ ...config, targetFieldId: event.target.value })}
                 >
-                  <option value="first">第一条</option>
-                  <option value="sum">求和</option>
-                  <option value="count">计数</option>
+                  <option value="">请选择文本、数字、日期或单选字段</option>
+                  {(targetSchema?.fields || []).filter((item) => ["text", "number", "date", "select"].includes(item.type)).map((item) => <option key={item.id} value={item.id}>{item.name} · {fieldTypes.find(([value]) => value === item.type)?.[1]}</option>)}
                 </select>
               </label>
-            </>
+              <div className="field-step lookup-rules">
+                <span><b>3</b>结果规则</span>
+                <label>多条记录处理
+                  <select value={config.aggregation || "first"} onChange={(event) => setConfig({ ...config, aggregation: event.target.value })}>
+                    <option value="first">取第一条</option>
+                    <option value="last">取最后一条</option>
+                    <option value="unique_concat">去重拼接</option>
+                    <option value="count">计数</option>
+                    {targetSchema?.fields.find((item) => item.id === config.targetFieldId)?.type === "number" && <option value="sum">求和</option>}
+                    {targetSchema?.fields.find((item) => item.id === config.targetFieldId)?.type === "number" && <option value="average">平均值</option>}
+                    {["number", "date"].includes(targetSchema?.fields.find((item) => item.id === config.targetFieldId)?.type) && <option value="max">最大值</option>}
+                    {["number", "date"].includes(targetSchema?.fields.find((item) => item.id === config.targetFieldId)?.type) && <option value="min">最小值</option>}
+                  </select>
+                </label>
+                <label>空值处理
+                  <select value={config.emptyPolicy || "empty"} onChange={(event) => setConfig({ ...config, emptyPolicy: event.target.value })}>
+                    <option value="empty">显示为空</option>
+                    <option value="default">显示默认值</option>
+                    <option value="unmatched">显示未匹配</option>
+                  </select>
+                </label>
+                {config.emptyPolicy === "default" && <label>默认值<input value={config.defaultValue ?? ""} onChange={(event) => setConfig({ ...config, defaultValue: event.target.value })} /></label>}
+              </div>
+              {field && runtime?.dependency && (
+                <section className="dependency-panel">
+                  <div><strong>字段依赖</strong><span>{runtime.dependency.target_table_name} / {runtime.dependency.target_field_name}</span></div>
+                  <div><strong>计算状态</strong><span className={`calculation-status ${runtime.calculation?.status || "pending"}`}>{({ pending: "待计算", computing: "计算中", completed: "已完成", partial: "部分失败", failed: "失败" })[runtime.calculation?.status] || "待计算"}</span></div>
+                  {runtime.calculation && <div><strong>处理进度</strong><span>{formatNumber(runtime.calculation.processed_records)} / {formatNumber(runtime.calculation.total_records)}</span></div>}
+                  {runtime.calculation?.error_message && <p>{runtime.calculation.error_message}</p>}
+                  <footer>
+                    <Button icon={RefreshCw} onClick={() => recalculate(false)} disabled={saving}>重新计算</Button>
+                    {(runtime.calculation?.failed_records > 0 || runtime.failures?.length > 0) && <Button onClick={() => recalculate(true)} disabled={saving}>重试失败记录</Button>}
+                  </footer>
+                </section>
+              )}
+            </div>
+          )}
+          {impact && (
+            <div className="impact-warning">
+              <CircleAlert size={18} />
+              <div>
+                <strong>{impact.operation === "delete" ? "删除字段会影响查找引用" : "修改字段类型会影响查找引用"}</strong>
+                <p>{impact.details?.affectedTables || 0} 张数据表、{impact.details?.affectedFields || 0} 个字段、{formatNumber(impact.details?.affectedRecords || 0)} 条记录将受影响。</p>
+                <Button danger onClick={() => impact.operation === "delete" ? removeField(true) : save(true)} disabled={saving}>确认并继续</Button>
+              </div>
+            </div>
           )}
           {error && <div className="alert error">{error}</div>}
         </div>
         <footer>
+          {field && <Button danger icon={Trash2} onClick={() => removeField(false)} disabled={saving}>删除字段</Button>}
           <Button onClick={onClose}>取消</Button>
-          <Button primary disabled={saving || !name.trim()} onClick={save}>
+          <Button primary disabled={saving || !name.trim()} onClick={() => save(false)}>
             {saving ? "保存中" : "保存字段"}
           </Button>
         </footer>
       </aside>
+    </div>
+  );
+}
+
+function RelationPicker({ field, value, onChange, initialLabels = [] }) {
+  const [search, setSearch] = useState("");
+  const [options, setOptions] = useState(initialLabels);
+  const ids = (Array.isArray(value) ? value : value ? [value] : []).map(String);
+  useEffect(() => {
+    if (!field.config?.targetTableId || !field.config?.matchFieldId || !field.config?.returnFieldId) return undefined;
+    let active = true;
+    const timer = setTimeout(() => {
+      const query = new URLSearchParams({
+        matchFieldId: field.config.matchFieldId,
+        returnFieldId: field.config.returnFieldId,
+        ...(search ? { search } : {}),
+      });
+      api(`/tables/${field.config.targetTableId}/record-options?${query}`).then((result) => {
+        if (active) setOptions([...initialLabels, ...result].filter((item, index, all) => all.findIndex((other) => other.id === item.id) === index));
+      }).catch(() => {});
+    }, 180);
+    return () => { active = false; clearTimeout(timer); };
+  }, [field.id, field.config?.targetTableId, field.config?.matchFieldId, field.config?.returnFieldId, search]);
+  function toggle(id) {
+    if (field.config?.multiple === false) onChange(ids.includes(id) ? [] : [id]);
+    else onChange(ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id]);
+  }
+  const selected = ids.map((id) => options.find((item) => item.id === id) || { id, label: `记录 #${id}` });
+  return (
+    <div className="relation-picker">
+      <div className="relation-selected">
+        {selected.length ? selected.map((item) => <button type="button" key={item.id} onClick={() => toggle(item.id)}>{item.label}<X size={12} /></button>) : <span>尚未选择关联记录</span>}
+      </div>
+      <div className="relation-search"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索目标记录" /></div>
+      <div className="relation-options">
+        {options.slice(0, 50).map((item) => <button type="button" className={ids.includes(item.id) ? "selected" : ""} key={item.id} onClick={() => toggle(item.id)}><span>{item.label}</span><small>{item.matchValue && item.matchValue !== item.label ? item.matchValue : `#${item.id}`}</small></button>)}
+      </div>
     </div>
   );
 }
@@ -856,7 +1018,8 @@ function RecordDrawer({ record, fields, tableId, onClose, onSaved }) {
       );
     if (field.type === "number")
       return <input type="number" step="any" {...common} />;
-    if (field.type === "lookup") return <input value={value} readOnly />;
+    if (field.type === "relation") return <RelationPicker field={field} value={value} initialLabels={record?.relationLabels?.[field.id] || []} onChange={(next) => setValues({ ...values, [field.id]: next })} />;
+    if (field.type === "lookup") return <div className="lookup-readonly"><CellValue field={field} value={value} lookupStatus={record?.lookupStatuses?.[field.id]} /><small>只读结果，请修改关联记录或来源数据</small></div>;
     return field.config?.multiline ? (
       <textarea {...common} />
     ) : (
@@ -867,15 +1030,20 @@ function RecordDrawer({ record, fields, tableId, onClose, onSaved }) {
     setSaving(true);
     setError("");
     try {
+      const editableValues = Object.fromEntries(
+        fields
+          .filter((field) => field.type !== "lookup")
+          .map((field) => [field.id, values[field.id] ?? null]),
+      );
       if (record)
         await api(`/records/${record.id}`, {
           method: "PATCH",
-          body: { values, version: record.version },
+          body: { values: editableValues, version: record.version },
         });
       else
         await api(`/tables/${tableId}/records`, {
           method: "POST",
-          body: { values },
+          body: { values: editableValues },
         });
       onSaved();
     } catch (err) {
@@ -1044,6 +1212,20 @@ function Workbench({ tables, tableId, onReloadTables }) {
   useEffect(() => {
     initialize();
   }, [tableId]);
+  useEffect(() => {
+    const calculating = schema?.fields.some((field) => ["pending", "computing"].includes(field.calculation?.status));
+    const recordPending = data.records.some((record) => Object.values(record.lookupStatuses || {}).some((status) => ["pending", "computing"].includes(status.status)));
+    if (!calculating && !recordPending) return undefined;
+    const timer = setInterval(async () => {
+      const [current, records] = await Promise.all([
+        api(`/tables/${tableId}/schema`),
+        fetchRecords(after, filters),
+      ]);
+      setSchema(current);
+      setData(records);
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [tableId, schema, data.records, after, filters]);
   useEffect(() => {
     const tabs = document.querySelector(".view-tabs");
     if (!tabs || !schema) return undefined;
@@ -1380,6 +1562,8 @@ function Workbench({ tables, tableId, onReloadTables }) {
                           <CellValue
                             field={field}
                             value={record.values?.[field.id]}
+                            relationLabels={record.relationLabels?.[field.id]}
+                            lookupStatus={record.lookupStatuses?.[field.id]}
                           />
                         </button>
                       </td>

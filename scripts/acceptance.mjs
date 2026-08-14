@@ -94,7 +94,16 @@ const targetTable = tables.at(-1);
 const targetSchema = await request(`/api/tables/${targetTable.id}/schema`);
 const relationField = await request(`/api/tables/${tables[0].id}/fields`, {
   method: "POST",
-  body: { name: "验收临时关联", type: "relation", config: { targetTableId: targetTable.id } },
+  body: {
+    name: "验收临时关联",
+    type: "relation",
+    config: {
+      targetTableId: targetTable.id,
+      matchFieldId: targetSchema.fields[0].id,
+      returnFieldId: targetSchema.fields[0].id,
+      multiple: true,
+    },
+  },
 });
 const lookupField = await request(`/api/tables/${tables[0].id}/fields`, {
   method: "POST",

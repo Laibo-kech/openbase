@@ -113,6 +113,94 @@ CREATE INDEX IF NOT EXISTS records_table_seek_idx ON records(table_id, id) WHERE
 CREATE INDEX IF NOT EXISTS records_table_updated_idx ON records(table_id, updated_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS records_values_gin_idx ON records USING gin(values jsonb_path_ops) WHERE deleted_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS record_relations (
+  source_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  source_table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  relation_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+  target_table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  target_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  ordinal integer NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_record_id, relation_field_id, target_record_id)
+);
+CREATE INDEX IF NOT EXISTS record_relations_source_idx
+  ON record_relations(source_table_id, relation_field_id, source_record_id, ordinal);
+CREATE INDEX IF NOT EXISTS record_relations_target_idx
+  ON record_relations(target_table_id, target_record_id, relation_field_id, source_record_id);
+
+CREATE TABLE IF NOT EXISTS lookup_dependencies (
+  lookup_field_id uuid PRIMARY KEY REFERENCES fields(id) ON DELETE CASCADE,
+  source_table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  relation_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE RESTRICT,
+  target_table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE RESTRICT,
+  target_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE RESTRICT,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS lookup_dependencies_target_idx
+  ON lookup_dependencies(target_table_id, target_field_id);
+CREATE INDEX IF NOT EXISTS lookup_dependencies_relation_idx
+  ON lookup_dependencies(relation_field_id);
+
+CREATE TABLE IF NOT EXISTS lookup_values (
+  lookup_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+  source_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  value jsonb,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','computing','completed','failed')),
+  error_code text,
+  error_message text,
+  calculated_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (lookup_field_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS lookup_values_status_idx
+  ON lookup_values(lookup_field_id, status, source_record_id);
+
+CREATE TABLE IF NOT EXISTS lookup_dirty_records (
+  lookup_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+  source_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  reason text NOT NULL DEFAULT 'source_changed',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (lookup_field_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS lookup_dirty_created_idx
+  ON lookup_dirty_records(lookup_field_id, created_at, source_record_id);
+
+CREATE TABLE IF NOT EXISTS lookup_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  lookup_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+  requested_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  requested_by text NOT NULL,
+  mode text NOT NULL DEFAULT 'incremental' CHECK (mode IN ('full','incremental','retry_failed')),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','computing','completed','partial','failed')),
+  total_records bigint NOT NULL DEFAULT 0,
+  processed_records bigint NOT NULL DEFAULT 0,
+  success_records bigint NOT NULL DEFAULT 0,
+  failed_records bigint NOT NULL DEFAULT 0,
+  batch_size integer NOT NULL DEFAULT 1000,
+  last_record_id bigint NOT NULL DEFAULT 0,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS lookup_jobs_one_active_field_idx
+  ON lookup_jobs(lookup_field_id) WHERE status IN ('pending','computing');
+CREATE INDEX IF NOT EXISTS lookup_jobs_status_idx ON lookup_jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS lookup_job_failures (
+  job_id uuid NOT NULL REFERENCES lookup_jobs(id) ON DELETE CASCADE,
+  lookup_field_id uuid NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+  source_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  error_code text NOT NULL,
+  error_message text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (job_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS lookup_job_failures_field_idx
+  ON lookup_job_failures(lookup_field_id, source_record_id);
+
 CREATE TABLE IF NOT EXISTS import_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
