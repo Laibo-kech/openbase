@@ -74,6 +74,12 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text); fon
 
 @media (max-width: 760px) {
   body { min-width: 0; }
+  .login-page { height: auto; min-height: 100%; padding: 38px 16px 44px; border-left-width: 6px; overflow-y: auto; }
+  .login-brand { position: static; margin: 0 10px; }
+  .login-brand h1 { font-size: 22px; }
+  .login-panel { position: static; width: 100%; min-height: 0; margin-top: 26px; padding: 28px 20px 34px; transform: none; }
+  .login-panel label { margin-top: 22px; }
+  .version { position: static; display: block; margin: 36px 10px 0; }
   .topbar { gap: 8px; padding: 0 10px; }
   .topbar > strong, .topbar .crumb, .top-actions .saved { display: none; }
   .back-button { margin-left: 0; }
