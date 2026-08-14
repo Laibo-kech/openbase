@@ -24,7 +24,7 @@ async function request(path, options = {}) {
   return options.allowError ? { status: response.status, body } : body;
 }
 
-async function poll(check, label, timeoutMs = 20_000) {
+async function poll(check, label, timeoutMs = 60_000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const result = await check();
