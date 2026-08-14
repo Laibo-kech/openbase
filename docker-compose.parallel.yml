@@ -1,0 +1,46 @@
+services:
+  app:
+    build: .
+    image: multibase-v1:2.0.0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 15280
+      DATABASE_URL: postgres://multibase:${POSTGRES_PASSWORD}@db:5432/multibase
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:15280:15280"
+    volumes:
+      - ${UPLOADS_PATH:-./data/uploads}:/app/uploads
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:15280/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [multibase]
+
+  admin:
+    build: .
+    image: multibase-v1:2.0.0
+    command: ["node", "server/admin.mjs"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ADMIN_PORT: 15281
+      DATABASE_URL: postgres://multibase:${POSTGRES_PASSWORD}@db:5432/multibase
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:15281:15281"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:15281/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [multibase]
+
+networks:
+  multibase:
+    external: true
+    name: multibase-v1

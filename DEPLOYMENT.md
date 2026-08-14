@@ -31,6 +31,8 @@ docker compose exec -T db pg_dump -U multibase -d multibase -Fc > multibase-befo
 
 大型升级应先使用新镜像和独立候选端口验证，不直接覆盖当前入口。至少检查：
 
+连接现有生产数据库做平行升级时，可使用 `docker-compose.parallel.yml`。它只启动 V2 应用和管理后台，监听 `127.0.0.1:15280/15281`，旧版 `13280/13281` 继续保留用于回滚。
+
 - 自动化测试和前端构建
 - 应用与管理后台健康接口
 - 登录、权限隔离和核心数据操作
