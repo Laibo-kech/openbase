@@ -165,19 +165,18 @@ export async function enqueueLookupJob({ lookupFieldId, mode = "incremental", us
     totalQuery = "SELECT count(*)::bigint total FROM lookup_dirty_records WHERE lookup_field_id=$1";
   }
   const total = (await client.query(totalQuery, [lookupFieldId])).rows[0]?.total || 0;
-  try {
-    return (await client.query(
-      `INSERT INTO lookup_jobs(lookup_field_id,requested_by_user_id,requested_by,mode,total_records)
-       VALUES($1,$2,$3,$4,$5) RETURNING *`,
-      [lookupFieldId, user?.id || null, user?.username || "system", mode, total],
-    )).rows[0];
-  } catch (error) {
-    if (error.code !== "23505") throw error;
-    return (await client.query(
-      "SELECT * FROM lookup_jobs WHERE lookup_field_id=$1 AND status IN ('pending','computing') ORDER BY created_at DESC LIMIT 1",
-      [lookupFieldId],
-    )).rows[0];
-  }
+  const inserted = (await client.query(
+    `INSERT INTO lookup_jobs(lookup_field_id,requested_by_user_id,requested_by,mode,total_records)
+     VALUES($1,$2,$3,$4,$5)
+     ON CONFLICT(lookup_field_id) WHERE status IN ('pending','computing') DO NOTHING
+     RETURNING *`,
+    [lookupFieldId, user?.id || null, user?.username || "system", mode, total],
+  )).rows[0];
+  if (inserted) return inserted;
+  return (await client.query(
+    "SELECT * FROM lookup_jobs WHERE lookup_field_id=$1 AND status IN ('pending','computing') ORDER BY created_at DESC LIMIT 1",
+    [lookupFieldId],
+  )).rows[0];
 }
 
 export async function enqueueDirtyLookupJobs(client, lookupFieldIds, user) {
