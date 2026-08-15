@@ -438,12 +438,20 @@ async function previewBatch(job, config, records) {
 }
 
 async function ensureRelationField(config, client) {
-  if (config.relation_field_id) {
+  const currentConfig = (await client.query(
+    "SELECT relation_field_id FROM catalog_match_configs WHERE id=$1 FOR UPDATE",
+    [config.id],
+  )).rows[0];
+  const relationFieldId = currentConfig?.relation_field_id || config.relation_field_id;
+  if (relationFieldId) {
     const existing = (await client.query(
       "SELECT id FROM fields WHERE id=$1 AND table_id=$2 AND type='relation' AND deleted_at IS NULL",
-      [config.relation_field_id, config.source_table_id],
+      [relationFieldId, config.source_table_id],
     )).rows[0];
-    if (existing) return existing.id;
+    if (existing) {
+      config.relation_field_id = existing.id;
+      return existing.id;
+    }
   }
   const definition = await loadDefinition(config.definition_id, client);
   const firstFieldId = definition.unique_field_ids[0];
@@ -469,6 +477,7 @@ async function ensureRelationField(config, client) {
     }), position],
   )).rows[0];
   await client.query("UPDATE catalog_match_configs SET relation_field_id=$2,updated_at=now() WHERE id=$1", [config.id, field.id]);
+  config.relation_field_id = field.id;
   return field.id;
 }
 

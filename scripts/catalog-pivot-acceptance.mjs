@@ -149,7 +149,15 @@ try {
   await waitFor(`/api/fields/${lookupName.id}/dependencies`, ["completed", "partial"]);
   await waitFor(`/api/fields/${lookupCategory.id}/dependencies`, ["completed", "partial"]);
   const matchedRecords = await request(`/api/tables/${sourceTable.id}/records?limit=20`);
-  if (matchedRecords.records.filter((record) => record.values[relationField.id]?.length).length !== 3) throw new Error("Applied relation values are incomplete");
+  const linkedRecords = matchedRecords.records.filter((record) => record.values[relationField.id]?.length);
+  if (linkedRecords.length !== 3) {
+    throw new Error(`Applied relation values are incomplete: ${JSON.stringify({
+      expected: 3,
+      actual: linkedRecords.length,
+      applied: appliedJob.applied_records,
+      values: matchedRecords.records.map((record) => ({ id: record.id, relation: record.values[relationField.id] })),
+    })}`);
+  }
   if (!matchedRecords.records.some((record) => record.values[lookupName.id] === "Gamma Widget")) throw new Error("Lookup did not return the standard catalog name");
 
   const aliasPreview = await request(`/api/catalog-configs/${matchConfig.id}/preview`, { method: "POST", body: { mode: "full" } }, 202);
