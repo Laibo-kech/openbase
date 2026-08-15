@@ -1092,6 +1092,7 @@ app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, 
     const sourceRows = parsed.rows;
     if (!sourceRows.length) throw httpError(400, "文件中没有可导入的数据，请从“数据导入”工作表第 2 行开始填写", "IMPORT_EMPTY");
     if (sourceRows.length > 50_000) throw httpError(400, "网页直接导入单次最多 5 万行；更大文件请使用分批导入", "IMPORT_TOO_LARGE");
+    await pool.query("UPDATE import_jobs SET total_rows=$2 WHERE id=$1", [job.id, sourceRows.length]);
     const fields = await getFields(req.params.tableId);
     const byName = new Map(fields.filter((field) => field.type !== "lookup").map((field) => [field.name, field]));
     const byId = new Map(fields.filter((field) => field.type !== "lookup").map((field) => [field.id, field]));
