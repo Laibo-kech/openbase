@@ -179,10 +179,10 @@ export async function getCatalogDuplicates(definitionId, limit = 50) {
     await rebuildCatalogDefinition(definitionId);
   }
   const { rows } = await pool.query(
-    `SELECT i.normalized_key,i.key_values,count(*)::int record_count,
+    `SELECT i.normalized_key,(min(i.key_values::text))::jsonb key_values,count(*)::int record_count,
       jsonb_agg(jsonb_build_object('id',i.catalog_record_id,'values',r.values) ORDER BY i.catalog_record_id) records
      FROM catalog_definition_index i JOIN records r ON r.id=i.catalog_record_id AND r.deleted_at IS NULL
-     WHERE i.definition_id=$1 GROUP BY i.normalized_key,i.key_values HAVING count(*)>1
+     WHERE i.definition_id=$1 GROUP BY i.normalized_key HAVING count(*)>1
      ORDER BY count(*) DESC,i.normalized_key LIMIT $2`,
     [definitionId, Math.max(1, Math.min(200, Number(limit) || 50))],
   );
