@@ -117,7 +117,7 @@ label { display: flex; flex-direction: column; gap: 8px; color: var(--text); fon
 /* Catalog matching and server-side pivot workspaces */
 .feature-page { padding: 30px 36px; overflow: hidden; }
 body:has(.feature-modal) .feature-page { overflow: visible; }
-.feature-page .overlay { left: 240px; }
+.feature-overlay { left: 240px; }
 .feature-page > .page-heading { height: 58px; }
 .segmented { height: 34px; display: inline-flex; padding: 3px; border: 1px solid var(--border); border-radius: 5px; background: #fff; }
 .segmented button { min-width: 92px; padding: 0 12px; border: 0; border-radius: 3px; color: var(--muted); background: transparent; cursor: pointer; }
@@ -278,7 +278,7 @@ body:has(.feature-modal) .feature-page { overflow: visible; }
 
 @media (max-width: 760px) {
   .feature-page { padding: 18px 12px; overflow: auto; }
-  .feature-page .overlay { left: 0; }
+  .feature-overlay { left: 0; }
   .feature-page > .page-heading { height: auto; flex-direction: column; }
   .feature-page .heading-actions { width: 100%; overflow-x: auto; }
   .definition-page, .catalog-layout, .pivot-layout { position: static; width: 100%; min-height: calc(100vh - 230px); margin-top: 18px; }

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   Calculator,
@@ -35,7 +36,7 @@ function IconButton({ icon: Icon, label, ...props }) {
 }
 
 function PivotModal({ title, children, footer, onClose, wide }) {
-  return <div className="overlay"><section className={`modal feature-modal ${wide ? "wide" : ""}`}><header><h2>{title}</h2><IconButton icon={X} label="关闭" onClick={onClose} /></header><div className="modal-body">{children}</div>{footer && <footer>{footer}</footer>}</section></div>;
+  return createPortal(<div className="overlay feature-overlay"><section className={`modal feature-modal ${wide ? "wide" : ""}`}><header><h2>{title}</h2><IconButton icon={X} label="关闭" onClick={onClose} /></header><div className="modal-body">{children}</div>{footer && <footer>{footer}</footer>}</section></div>, document.body);
 }
 
 function Notice({ type = "info", children }) {

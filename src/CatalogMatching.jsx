@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   Check,
@@ -60,14 +61,15 @@ function ActionButton({ icon: Icon, primary, danger, children, ...props }) {
 }
 
 function FeatureModal({ title, wide, children, footer, onClose }) {
-  return (
-    <div className="overlay">
+  return createPortal(
+    <div className="overlay feature-overlay">
       <section className={`modal feature-modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true">
         <header><h2>{title}</h2><IconButton icon={X} label="关闭" onClick={onClose} /></header>
         <div className="modal-body">{children}</div>
         {footer && <footer>{footer}</footer>}
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
