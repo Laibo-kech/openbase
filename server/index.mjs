@@ -727,6 +727,8 @@ app.patch("/api/fields/:fieldId", async (req, res, next) => {
   try {
     const current = (await pool.query("SELECT * FROM fields WHERE id=$1 AND deleted_at IS NULL", [req.params.fieldId])).rows[0];
     if (!current) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
+    const name = req.body?.name === undefined ? current.name : String(req.body.name).trim();
+    if (!name) throw httpError(400, "字段名称不能为空", "FIELD_NAME_REQUIRED");
     const type = req.body?.type === undefined ? current.type : String(req.body.type);
     if (!["text","number","date","select","relation","lookup"].includes(type)) throw httpError(400, "字段类型无效", "FIELD_TYPE_INVALID");
     if (type !== current.type && ["relation", "lookup"].includes(current.type)) {
@@ -759,8 +761,8 @@ app.patch("/api/fields/:fieldId", async (req, res, next) => {
       const configInput = req.body?.config === undefined ? current.config : req.body.config;
       const config = await normalizeFieldConfig(current.table_id, type, configInput, current.id, client);
       const updated = (await client.query(
-        "UPDATE fields SET name=COALESCE($2,name),type=$3,config=$4::jsonb,updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING *",
-        [req.params.fieldId, req.body?.name || null, type, JSON.stringify(config)],
+        "UPDATE fields SET name=$2,type=$3,config=$4::jsonb,updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING *",
+        [req.params.fieldId, name, type, JSON.stringify(config)],
       )).rows[0];
       if (type === "lookup") await saveLookupDependency(client, updated);
       else await removeLookupDependency(client, updated.id);
@@ -1078,11 +1080,17 @@ app.get("/api/tables/:tableId/import-template.xlsx", async (req, res, next) => {
 });
 
 app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, next) => {
+  let job = null;
   try {
     if (!req.file) throw httpError(400, "请选择文件", "FILE_REQUIRED");
+    await assertOwnedTable(req.params.tableId, req.user.id);
+    job = (await pool.query(
+      "INSERT INTO import_jobs(table_id,filename,status) VALUES($1,$2,'validating') RETURNING *",
+      [req.params.tableId, req.file.originalname],
+    )).rows[0];
     const parsed = await parseImportBuffer(req.file);
     const sourceRows = parsed.rows;
-    if (!sourceRows.length) throw httpError(400, "文件中没有可导入的数据", "IMPORT_EMPTY");
+    if (!sourceRows.length) throw httpError(400, "文件中没有可导入的数据，请从“数据导入”工作表第 2 行开始填写", "IMPORT_EMPTY");
     if (sourceRows.length > 50_000) throw httpError(400, "网页直接导入单次最多 5 万行；更大文件请使用分批导入", "IMPORT_TOO_LARGE");
     const fields = await getFields(req.params.tableId);
     const byName = new Map(fields.filter((field) => field.type !== "lookup").map((field) => [field.name, field]));
@@ -1091,7 +1099,20 @@ app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, 
       const validTemplate = (await pool.query("SELECT 1 FROM import_templates WHERE table_id=$1 AND import_id=$2", [req.params.tableId, parsed.importId])).rowCount;
       if (!validTemplate || parsed.tableId !== req.params.tableId) throw httpError(400, "导入模板不属于当前数据表，请重新下载模板", "IMPORT_TEMPLATE_MISMATCH");
     }
-    const job = (await pool.query("INSERT INTO import_jobs(table_id,filename,status,total_rows) VALUES($1,$2,'validating',$3) RETURNING *", [req.params.tableId,req.file.originalname,sourceRows.length])).rows[0];
+    const fieldMap = parsed.importId ? byId : byName;
+    const sourceColumns = [...new Set(sourceRows.flatMap((row) => Object.keys(row)))];
+    const recognizedColumns = sourceColumns.filter((column) => fieldMap.has(column));
+    const ignoredColumns = sourceColumns.filter((column) => !fieldMap.has(column));
+    if (!recognizedColumns.length) {
+      throw Object.assign(
+        httpError(400, "文件列名与当前数据表字段不匹配，请重新下载模板或检查首行字段名称", "IMPORT_COLUMNS_UNRECOGNIZED"),
+        { details: { sourceColumns: sourceColumns.slice(0, 50), expectedColumns: [...fieldMap.keys()].slice(0, 50) } },
+      );
+    }
+    await pool.query(
+      "UPDATE import_jobs SET status='importing',total_rows=$2,details=$3::jsonb WHERE id=$1",
+      [job.id, sourceRows.length, JSON.stringify({ ignoredColumns })],
+    );
     let success = 0; const errors = [];
     await withTransaction(async (client) => {
       const insertedIds = [];
@@ -1101,9 +1122,10 @@ app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, 
           try {
             const raw = sourceRows[index]; const values = {};
             for (const [key, value] of Object.entries(raw)) {
-              const field = parsed.importId ? byId.get(key) : byName.get(key);
+              const field = fieldMap.get(key);
               if (field) values[field.id] = normalizeValue(field, value);
             }
+            if (!Object.keys(values).length) throw httpError(400, "这一行没有可识别的字段", "IMPORT_ROW_UNRECOGNIZED");
             batch.push(values);
           } catch (error) { errors.push({ row: index + 2, message: error.message }); }
         }
@@ -1122,11 +1144,34 @@ app.post("/api/tables/:tableId/import", upload.single("file"), async (req, res, 
       }
       const dirty = await markLookupsDirtyForSource(client, req.params.tableId, insertedIds, "source_imported");
       await enqueueDirtyLookupJobs(client, dirty, req.user);
-      await client.query("UPDATE import_jobs SET status=$2,success_rows=$3,error_rows=$4,details=$5::jsonb,completed_at=now() WHERE id=$1", [job.id, errors.length ? "completed_with_errors" : "completed", success, errors.length, JSON.stringify({ errors: errors.slice(0,200) })]);
+      await client.query(
+        "UPDATE import_jobs SET status=$2,success_rows=$3,error_rows=$4,details=$5::jsonb,completed_at=now() WHERE id=$1",
+        [job.id, errors.length ? "completed_with_errors" : "completed", success, errors.length, JSON.stringify({ errors: errors.slice(0,200), ignoredColumns })],
+      );
       await writeAudit({ actor: req.user.username, action: "import", objectType: "import_job", objectId: job.id, details: { total: sourceRows.length, success, errors: errors.length, importId: parsed.importId || null }, ip: req.ip }, client);
     });
-    res.status(201).json({ id: job.id, totalRows: sourceRows.length, successRows: success, errorRows: errors.length, errors: errors.slice(0,20) });
-  } catch (error) { next(error); }
+    res.status(201).json({
+      id: job.id,
+      totalRows: sourceRows.length,
+      successRows: success,
+      errorRows: errors.length,
+      errors: errors.slice(0,20),
+      ignoredColumns,
+    });
+  } catch (error) {
+    if (job) {
+      try {
+        await pool.query(
+          `UPDATE import_jobs SET status='failed',error_rows=CASE WHEN total_rows > 0 THEN total_rows ELSE 1 END,
+           details=$2::jsonb,completed_at=now() WHERE id=$1`,
+          [job.id, JSON.stringify({ error: error.message, code: error.code || "IMPORT_FAILED", details: error.details || null })],
+        );
+      } catch (jobError) {
+        console.error("failed to record import error", jobError);
+      }
+    }
+    next(error);
+  }
 });
 
 function csvCell(value) {
@@ -1148,11 +1193,19 @@ function excelCellValue(value) {
 async function parseImportBuffer(file) {
   const lower = file.originalname.toLowerCase();
   if (lower.endsWith(".csv")) {
-    return { rows: parseCsv(file.buffer, { bom: true, columns: true, skip_empty_lines: true, relax_column_count: true }), importId: null, tableId: null };
+    try {
+      return { rows: parseCsv(file.buffer, { bom: true, columns: true, skip_empty_lines: true, relax_column_count: true }), importId: null, tableId: null };
+    } catch {
+      throw httpError(400, "CSV 文件无法解析，请检查编码、首行字段名称和列数", "IMPORT_CSV_INVALID");
+    }
   }
   if (!lower.endsWith(".xlsx")) throw httpError(400, "仅支持 .xlsx 和 .csv 文件", "IMPORT_TYPE_INVALID");
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(file.buffer);
+  try {
+    await workbook.xlsx.load(file.buffer);
+  } catch {
+    throw httpError(400, "XLSX 文件已损坏或不是有效的 Excel 工作簿", "IMPORT_XLSX_INVALID");
+  }
   const meta = workbook.getWorksheet("_multibase_meta");
   const sheet = workbook.getWorksheet("数据导入") || workbook.worksheets.find((item) => item.name !== "_multibase_meta" && item.name !== "导入说明");
   if (!sheet) return { rows: [], importId: null, tableId: null };

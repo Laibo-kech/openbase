@@ -62,6 +62,24 @@ test("table-scoped import templates and filtered export estimates are implemente
   assert.equal(app.includes("导出任务中心"), false);
 });
 
+test("failed imports are visible and fields have explicit management actions", () => {
+  const server = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8");
+  const app = fs.readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  for (const marker of [
+    "IMPORT_COLUMNS_UNRECOGNIZED",
+    "IMPORT_XLSX_INVALID",
+    "UPDATE import_jobs SET status='failed'",
+    "这一行没有可识别的字段",
+  ]) assert.equal(server.includes(marker), true, marker);
+  for (const marker of [
+    "导入失败",
+    "field-manager-modal",
+    "字段管理",
+    "编辑字段",
+    "删除字段",
+  ]) assert.equal(app.includes(marker), true, marker);
+});
+
 test("multi-user isolation, registration and separate admin console are implemented", () => {
   const server = fs.readFileSync(new URL("../server/index.mjs", import.meta.url), "utf8");
   const database = fs.readFileSync(new URL("../server/db.mjs", import.meta.url), "utf8");

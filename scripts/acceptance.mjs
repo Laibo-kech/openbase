@@ -33,6 +33,22 @@ async function request(path, options = {}) {
   return result;
 }
 
+async function requestFailure(path, options = {}, expectedStatus = 400) {
+  const isForm = options.body instanceof FormData;
+  const response = await fetch(baseUrl + path, {
+    ...options,
+    headers: {
+      ...(options.body && !isForm ? { "Content-Type": "application/json" } : {}),
+      ...(cookie ? { Cookie: cookie } : {}),
+      ...options.headers,
+    },
+    body: options.body && !isForm && typeof options.body !== "string" ? JSON.stringify(options.body) : options.body,
+  });
+  const result = await response.json().catch(() => null);
+  if (response.status !== expectedStatus) throw new Error(`${options.method || "GET"} ${path}: expected ${expectedStatus}, received ${response.status}`);
+  return result;
+}
+
 async function findImportedRecord(tableId, fieldId, value) {
   const filters = encodeURIComponent(JSON.stringify([{ fieldId, operator: "eq", value }]));
   const page = await request(`/api/tables/${tableId}/records?limit=10&after=0&filters=${filters}`);
@@ -119,6 +135,20 @@ if (relationField.type !== "relation" || lookupField.type !== "lookup") {
 await request(`/api/fields/${lookupField.id}`, { method: "DELETE" });
 await request(`/api/fields/${relationField.id}`, { method: "DELETE" });
 
+const managedField = await request(`/api/tables/${tables[0].id}/fields`, {
+  method: "POST",
+  body: { name: `验收字段-${Date.now()}`, type: "text", config: {} },
+});
+const managedFieldName = `${managedField.name}-已重命名`;
+const renamedField = await request(`/api/fields/${managedField.id}`, {
+  method: "PATCH",
+  body: { name: managedFieldName },
+});
+if (renamedField.name !== managedFieldName) throw new Error("字段重命名失败");
+await request(`/api/fields/${managedField.id}`, { method: "DELETE" });
+const schemaAfterFieldDelete = await request(`/api/tables/${tables[0].id}/schema`);
+if (schemaAfterFieldDelete.fields.some((field) => field.id === managedField.id)) throw new Error("字段删除后仍出现在数据表中");
+
 const csvName = `验收CSV-${Date.now()}`;
 const csvForm = new FormData();
 csvForm.append(
@@ -159,6 +189,19 @@ const templateMeta = templateWorkbook.getWorksheet("_multibase_meta");
 const templateSheet = templateWorkbook.getWorksheet("数据导入");
 if (!templateMeta || templateMeta.state !== "veryHidden" || String(templateMeta.getCell("B1").value) !== templateInfo.importId || !templateSheet) {
   throw new Error("导入模板元数据或数据工作表无效");
+}
+const emptyTemplateForm = new FormData();
+emptyTemplateForm.append(
+  "file",
+  new Blob([templateBuffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+  "acceptance-empty-template.xlsx",
+);
+const emptyTemplateFailure = await requestFailure(`/api/tables/${tables[0].id}/import`, { method: "POST", body: emptyTemplateForm });
+if (emptyTemplateFailure?.code !== "IMPORT_EMPTY") throw new Error("空模板没有返回明确错误");
+const failedImportJobs = await request(`/api/bases/${bases[0].id}/imports`);
+const failedImportJob = failedImportJobs.find((job) => job.filename === "acceptance-empty-template.xlsx");
+if (failedImportJob?.status !== "failed" || failedImportJob.details?.code !== "IMPORT_EMPTY") {
+  throw new Error("导入失败没有写入最近导入任务");
 }
 const templateField = schema.fields.find((field) => field.type === "text");
 const headerCells = [];

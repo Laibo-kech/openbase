@@ -47,6 +47,13 @@ const fieldTypes = [
   ["relation", "关联记录"],
   ["lookup", "查找引用"],
 ];
+const importStatusNames = {
+  validating: "正在校验",
+  importing: "正在导入",
+  completed: "已完成",
+  completed_with_errors: "部分成功",
+  failed: "失败",
+};
 const emptyFilter = () => ({ fieldId: "", operator: "eq", value: "" });
 
 function Button({
@@ -68,10 +75,10 @@ function Button({
   );
 }
 
-function Modal({ title, children, onClose, footer }) {
+function Modal({ title, children, onClose, footer, className = "" }) {
   return (
     <div className="overlay">
-      <section className="modal" role="dialog" aria-modal="true">
+      <section className={`modal ${className}`} role="dialog" aria-modal="true">
         <header>
           <h2>{title}</h2>
           <button className="icon-button" onClick={onClose} title="关闭">
@@ -644,6 +651,70 @@ function CellValue({ field, value, relationLabels, lookupStatus }) {
   return <>{String(value)}</>;
 }
 
+function FieldManager({ fields, onAdd, onEdit, onDeleted, onClose }) {
+  const [deletingId, setDeletingId] = useState("");
+  const [error, setError] = useState("");
+
+  async function remove(field) {
+    setDeletingId(field.id);
+    setError("");
+    try {
+      const impact = await api(`/fields/${field.id}/impact`);
+      const dependentFields = Number(impact.affectedFields || 0);
+      const affectedRecords = Number(impact.affectedRecords || 0);
+      const catalogItems = Number(impact.catalog?.definitions?.length || 0) + Number(impact.catalog?.configs?.length || 0);
+      const pivotItems = Number(impact.pivot?.configs?.length || 0);
+      const impactText = dependentFields || affectedRecords || catalogItems || pivotItems
+        ? `\n\n受影响：${dependentFields} 个查找引用字段、${formatNumber(affectedRecords)} 条引用记录、${catalogItems} 个目录配置、${pivotItems} 个数据透视方案。`
+        : "";
+      if (!window.confirm(`确定删除字段“${field.name}”吗？字段将进入回收站，现有记录中的该列数据不会立即物理删除。${impactText}`)) return;
+      await api(`/fields/${field.id}?confirmImpact=true`, { method: "DELETE" });
+      await onDeleted();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDeletingId("");
+    }
+  }
+
+  return (
+    <Modal
+      title="字段管理"
+      className="field-manager-modal"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>完成</Button>
+          <Button primary icon={Plus} onClick={onAdd}>新增字段</Button>
+        </>
+      }
+    >
+      <div className="field-manager-heading">
+        <p>在这里统一新增、重命名、配置或删除字段。</p>
+        <span>{fields.length} 个字段</span>
+      </div>
+      <div className="field-manager-list">
+        {fields.map((field) => (
+          <div className="field-manager-row" key={field.id}>
+            <div>
+              <strong>{field.name}</strong>
+              <small>{fieldTypes.find(([value]) => value === field.type)?.[1] || field.type}</small>
+            </div>
+            <button className="icon-button" title={`编辑字段 ${field.name}`} aria-label={`编辑字段 ${field.name}`} onClick={() => onEdit(field)}>
+              <Pencil size={16} />
+            </button>
+            <button className="icon-button danger-icon" title={`删除字段 ${field.name}`} aria-label={`删除字段 ${field.name}`} disabled={deletingId === field.id} onClick={() => remove(field)}>
+              {deletingId === field.id ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}
+            </button>
+          </div>
+        ))}
+        {!fields.length && <Empty title="暂无字段" description="新增字段后即可开始录入或导入数据。" />}
+      </div>
+      {error && <div className="alert error" role="alert"><CircleAlert size={18} /><span>{error}</span></div>}
+    </Modal>
+  );
+}
+
 function FieldDrawer({ field, tableId, tables, fields, onClose, onSaved }) {
   const [name, setName] = useState(field?.name || "");
   const [type, setType] = useState(field?.type || "text");
@@ -1199,6 +1270,7 @@ function Workbench({ tables, tableId, onReloadTables }) {
   const [filters, setFilters] = useState([]);
   const [filterDraft, setFilterDraft] = useState([emptyFilter()]);
   const [columnWidths, setColumnWidths] = useState({});
+  const [fieldManagerOpen, setFieldManagerOpen] = useState(false);
   const [fieldDrawer, setFieldDrawer] = useState(null);
   const [recordDrawer, setRecordDrawer] = useState(null);
   const [filterOpen, setFilterOpen] = useState(false);
@@ -1479,10 +1551,10 @@ function Workbench({ tables, tableId, onReloadTables }) {
         </Button>
         <button
           className="tool-button"
-          onClick={() => setFieldDrawer({ mode: "create" })}
+          onClick={() => setFieldManagerOpen(true)}
         >
           <SlidersHorizontal size={14} />
-          字段
+          字段管理
         </button>
         <button
           className={`tool-button ${filterOpen ? "active" : ""}`}
@@ -1669,6 +1741,21 @@ function Workbench({ tables, tableId, onReloadTables }) {
           }}
         />
       )}
+      {fieldManagerOpen && (
+        <FieldManager
+          fields={schema.fields}
+          onClose={() => setFieldManagerOpen(false)}
+          onAdd={() => {
+            setFieldManagerOpen(false);
+            setFieldDrawer({ mode: "create" });
+          }}
+          onEdit={(field) => {
+            setFieldManagerOpen(false);
+            setFieldDrawer({ field });
+          }}
+          onDeleted={refreshSchema}
+        />
+      )}
       {recordDrawer && (
         <RecordDrawer
           record={recordDrawer.record}
@@ -1693,19 +1780,26 @@ function Imports({ base, tables, onChanged }) {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
   async function load() {
     setJobs(await api(`/bases/${base.id}/imports`));
   }
   useEffect(() => {
-    load();
+    load().catch((err) => setError(err.message));
   }, [base.id]);
   useEffect(() => {
     setTemplate(null);
-    if (tableId) api(`/tables/${tableId}/import-template`).then(setTemplate);
+    if (tableId) api(`/tables/${tableId}/import-template`).then(setTemplate).catch((err) => setError(err.message));
   }, [tableId]);
   async function submit() {
     if (!file || !tableId) return;
+    if (file.size > 50 * 1024 * 1024) {
+      setError("文件超过 50 MB，请拆分后重新导入");
+      return;
+    }
     setBusy(true);
+    setError("");
+    setResult(null);
     const body = new FormData();
     body.append("file", file);
     try {
@@ -1714,8 +1808,10 @@ function Imports({ base, tables, onChanged }) {
         body,
       });
       setResult(value);
-      await load();
-      onChanged();
+      await Promise.all([load(), onChanged()]);
+    } catch (err) {
+      setError(err.message);
+      await load().catch(() => {});
     } finally {
       setBusy(false);
     }
@@ -1740,6 +1836,7 @@ function Imports({ base, tables, onChanged }) {
               setTableId(event.target.value);
               setFile(null);
               setResult(null);
+              setError("");
             }}
           >
             {tables.map((table) => (
@@ -1789,10 +1886,15 @@ function Imports({ base, tables, onChanged }) {
           <label className="file-drop">
             <FileSpreadsheet size={24} />
             <span>{file ? file.name : "点击选择 .xlsx 或 .csv 文件"}</span>
+            {file && <small>{formatBytes(file.size)}</small>}
             <input
               type="file"
               accept=".xlsx,.csv"
-              onChange={(event) => setFile(event.target.files[0])}
+              onChange={(event) => {
+                setFile(event.target.files[0] || null);
+                setResult(null);
+                setError("");
+              }}
             />
           </label>
           <Button
@@ -1804,9 +1906,19 @@ function Imports({ base, tables, onChanged }) {
             {busy ? "正在校验并导入" : "开始导入"}
           </Button>
           {result && (
-            <div className="alert success">
-              完成：成功 {formatNumber(result.successRows)} 行，错误{" "}
-              {formatNumber(result.errorRows)} 行
+            <div className={`alert ${result.errorRows ? "warning" : "success"}`} role="status">
+              <div>
+                <strong>导入完成</strong>
+                <p>成功 {formatNumber(result.successRows)} 行，错误 {formatNumber(result.errorRows)} 行</p>
+                {result.ignoredColumns?.length > 0 && <p>已忽略未匹配列：{result.ignoredColumns.join("、")}</p>}
+                {result.errors?.slice(0, 5).map((item) => <p key={`${item.row}-${item.message}`}>第 {item.row} 行：{item.message}</p>)}
+              </div>
+            </div>
+          )}
+          {error && (
+            <div className="alert error" role="alert">
+              <CircleAlert size={18} />
+              <div><strong>导入失败</strong><p>{error}</p></div>
             </div>
           )}
         </section>
@@ -1821,11 +1933,13 @@ function Imports({ base, tables, onChanged }) {
                     {job.table_name} ·{" "}
                     {new Date(job.created_at).toLocaleString("zh-CN")}
                   </small>
+                  {job.details?.error && <small className="job-error">{job.details.error}</small>}
+                  {!job.details?.error && job.details?.errors?.length > 0 && <small className="job-error">第 {job.details.errors[0].row} 行：{job.details.errors[0].message}</small>}
                 </div>
                 <span
-                  className={`status ${job.error_rows ? "warning" : "success"}`}
+                  className={`status ${job.status === "failed" ? "failure" : job.error_rows ? "warning" : "success"}`}
                 >
-                  {job.status}
+                  {importStatusNames[job.status] || job.status}
                 </span>
                 <span>{formatNumber(job.total_rows)} 行</span>
                 <span>成功 {formatNumber(job.success_rows)}</span>
