@@ -64,7 +64,7 @@ test("catalog and pivot endpoints and complete frontend workspaces are present",
   for (const marker of ["联合匹配字段", "模糊匹配候选", "选择目录记录", "保存为别名规则", "撤销本次任务"]) {
     assert.equal(catalogUi.includes(marker), true, marker);
   }
-  for (const marker of ["行字段", "列字段", "数值指标", "全部满足", "显示小计", "查看原始记录", "导出数据透视结果"]) {
+  for (const marker of ["行字段", "列字段", "数值指标", "全部满足", "显示小计", "查看原始记录", "导出数据透视结果", "onSaved(selected.id, job)"]) {
     assert.equal(pivotUi.includes(marker), true, marker);
   }
 });
