@@ -419,6 +419,10 @@ export async function getPivotDrilldown(jobId, rowIndex, { offset = 0, limit = 1
     [jobId],
   )).rows[0];
   if (!job) throw pivotError("数据透视任务不存在", "PIVOT_JOB_NOT_FOUND", 404);
+  const currentSource = await getPivotSourceVersion(job.table_id);
+  if (currentSource.value !== job.source_version) {
+    throw pivotError("来源数据已经变化，请重新计算数据透视后再查看原始记录", "PIVOT_DATA_UPDATED", 409);
+  }
   const resultRow = (await pool.query(
     "SELECT * FROM pivot_job_rows WHERE job_id=$1 AND row_index=$2",
     [jobId, rowIndex],

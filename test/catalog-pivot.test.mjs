@@ -58,7 +58,7 @@ test("catalog and pivot endpoints and complete frontend workspaces are present",
   for (const marker of ["incremental", "fuzzy_candidate", "manual_confirmed", "previous_target_ids", "FOR UPDATE"]) {
     assert.equal(catalog.includes(marker), true, marker);
   }
-  for (const marker of ["ROLLUP", "statement_timeout", "pg_cancel_backend", "10 minutes", "NULLS LAST"]) {
+  for (const marker of ["ROLLUP", "statement_timeout", "pg_cancel_backend", "10 minutes", "NULLS LAST", "PIVOT_DATA_UPDATED"]) {
     assert.equal(pivot.includes(marker), true, marker);
   }
   for (const marker of ["联合匹配字段", "模糊匹配候选", "选择目录记录", "保存为别名规则", "撤销本次任务"]) {

@@ -3,9 +3,11 @@ import { pool } from "../server/db.mjs";
 
 const baseUrl = process.env.ACCEPTANCE_BASE_URL || "http://127.0.0.1:14280";
 const suffix = Date.now().toString(36);
-const username = `catalog_pivot_${suffix}`;
-const password = crypto.randomBytes(24).toString("base64url");
+const username = process.env.ACCEPTANCE_USERNAME || `catalog_pivot_${suffix}`;
+const password = process.env.ACCEPTANCE_PASSWORD || crypto.randomBytes(24).toString("base64url");
+const keepFixture = process.env.KEEP_ACCEPTANCE_DATA === "true";
 let cookie = "";
+let fixtureBaseId = null;
 
 async function request(path, options = {}, expectedStatus = null) {
   const response = await fetch(baseUrl + path, {
@@ -55,6 +57,7 @@ async function createRecord(tableId, values) {
 try {
   await request("/api/auth/register", { method: "POST", body: { username, password } }, 201);
   const base = await request("/api/bases", { method: "POST", body: { name: `目录透视验收-${suffix}` } }, 201);
+  fixtureBaseId = base.id;
   let tables = await request(`/api/bases/${base.id}/tables`);
   const sourceTable = tables[0];
   await request(`/api/tables/${sourceTable.id}`, { method: "PATCH", body: { name: "业务订单" } });
@@ -241,10 +244,11 @@ try {
       exportXlsxBytes: xlsx.length,
       dataUpdated: true,
     },
+    ...(keepFixture ? { fixture: { username, baseId: fixtureBaseId } } : {}),
   }));
 } finally {
   const user = (await pool.query("SELECT id FROM users WHERE lower(username)=lower($1)", [username])).rows[0];
-  if (user) {
+  if (user && !keepFixture) {
     await pool.query("DELETE FROM bases WHERE owner_user_id=$1", [user.id]);
     await pool.query("DELETE FROM sessions WHERE user_id=$1", [user.id]);
     await pool.query("DELETE FROM users WHERE id=$1", [user.id]);
