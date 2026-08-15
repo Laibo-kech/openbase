@@ -281,7 +281,7 @@ function Login({ onLogin }) {
         </Button>
         <small>服务器地址：当前访问地址</small>
       </form>
-      <span className="version">V1 · 私有部署</span>
+      <span className="version">V3 · 私有部署</span>
     </main>
   );
 }

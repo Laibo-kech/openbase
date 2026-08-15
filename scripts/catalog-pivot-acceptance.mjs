@@ -6,6 +6,7 @@ const suffix = Date.now().toString(36);
 const username = process.env.ACCEPTANCE_USERNAME || `catalog_pivot_${suffix}`;
 const password = process.env.ACCEPTANCE_PASSWORD || crypto.randomBytes(24).toString("base64url");
 const keepFixture = process.env.KEEP_ACCEPTANCE_DATA === "true";
+const existingUser = process.env.ACCEPTANCE_EXISTING_USER === "true";
 let cookie = "";
 let fixtureBaseId = null;
 
@@ -55,7 +56,8 @@ async function createRecord(tableId, values) {
 }
 
 try {
-  await request("/api/auth/register", { method: "POST", body: { username, password } }, 201);
+  if (existingUser) await request("/api/auth/login", { method: "POST", body: { username, password } }, 200);
+  else await request("/api/auth/register", { method: "POST", body: { username, password } }, 201);
   const base = await request("/api/bases", { method: "POST", body: { name: `目录透视验收-${suffix}` } }, 201);
   fixtureBaseId = base.id;
   let tables = await request(`/api/bases/${base.id}/tables`);
@@ -249,9 +251,14 @@ try {
 } finally {
   const user = (await pool.query("SELECT id FROM users WHERE lower(username)=lower($1)", [username])).rows[0];
   if (user && !keepFixture) {
-    await pool.query("DELETE FROM bases WHERE owner_user_id=$1", [user.id]);
-    await pool.query("DELETE FROM sessions WHERE user_id=$1", [user.id]);
-    await pool.query("DELETE FROM users WHERE id=$1", [user.id]);
+    if (existingUser) {
+      if (fixtureBaseId) await pool.query("DELETE FROM bases WHERE id=$1 AND owner_user_id=$2", [fixtureBaseId, user.id]);
+      try { await request("/api/auth/logout", { method: "POST", body: {} }, 204); } catch { /* Cleanup already completed. */ }
+    } else {
+      await pool.query("DELETE FROM bases WHERE owner_user_id=$1", [user.id]);
+      await pool.query("DELETE FROM sessions WHERE user_id=$1", [user.id]);
+      await pool.query("DELETE FROM users WHERE id=$1", [user.id]);
+    }
   }
   await pool.end();
 }
