@@ -52,6 +52,14 @@ import {
   startPivotWorker,
   validatePivotConfig,
 } from "./pivot-service.mjs";
+import {
+  cancelBackgroundTask,
+  ensureCorePerformanceIndexes,
+  ensureFieldPerformanceIndexes,
+  estimateFieldIndexes,
+  recoverBackgroundTasks,
+  retryBackgroundTask,
+} from "./background-task-service.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.resolve(__dirname, "../dist");
@@ -287,6 +295,26 @@ async function assertOwnedPivotJob(jobId, userId, client = pool) {
     [jobId, userId],
   )).rows[0];
   if (!row) throw httpError(404, "数据透视任务不存在或无权访问", "PIVOT_JOB_NOT_FOUND");
+  return row;
+}
+
+async function assertOwnedTable(tableId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT t.* FROM data_tables t JOIN bases b ON b.id=t.base_id
+     WHERE t.id=$1 AND t.deleted_at IS NULL AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [tableId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "数据表不存在或无权访问", "TABLE_NOT_FOUND");
+  return row;
+}
+
+async function assertOwnedBackgroundTask(taskId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT task.* FROM background_tasks task JOIN bases b ON b.id=task.base_id
+     WHERE task.id=$1 AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [taskId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "后台任务不存在或无权访问", "BACKGROUND_TASK_NOT_FOUND");
   return row;
 }
 
@@ -785,6 +813,56 @@ app.post("/api/fields/:fieldId/recalculate", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get("/api/bases/:baseId/background-tasks", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const statuses = String(req.query.status || "").split(",").filter(Boolean);
+    const types = String(req.query.type || "").split(",").filter(Boolean);
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
+    const { rows } = await pool.query(
+      `SELECT task.*,t.name table_name FROM background_tasks task
+       JOIN data_tables t ON t.id=task.table_id
+       WHERE task.base_id=$1 AND ($2::text[]='{}' OR task.status=ANY($2::text[]))
+         AND ($3::text[]='{}' OR task.task_type=ANY($3::text[]))
+       ORDER BY task.created_at DESC LIMIT $4`,
+      [req.params.baseId, statuses, types, limit],
+    );
+    res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/background-tasks/:taskId", async (req, res, next) => {
+  try {
+    const task = await assertOwnedBackgroundTask(req.params.taskId, req.user.id);
+    res.json(task);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/background-tasks/:taskId/cancel", async (req, res, next) => {
+  try {
+    await assertOwnedBackgroundTask(req.params.taskId, req.user.id);
+    const task = await cancelBackgroundTask(req.params.taskId);
+    await writeAudit({ actor: req.user.username, action: "cancel", objectType: "background_task", objectId: task.id, ip: req.ip });
+    res.json(task);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/background-tasks/:taskId/retry", async (req, res, next) => {
+  try {
+    await assertOwnedBackgroundTask(req.params.taskId, req.user.id);
+    const task = await retryBackgroundTask(req.params.taskId);
+    await writeAudit({ actor: req.user.username, action: "retry", objectType: "background_task", objectId: task.id, ip: req.ip });
+    res.status(202).json(task);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/tables/:tableId/index-estimate", async (req, res, next) => {
+  try {
+    await assertOwnedTable(req.params.tableId, req.user.id);
+    res.json(await estimateFieldIndexes(req.params.tableId, req.body?.fieldIds));
+  } catch (error) { next(error); }
+});
+
 app.delete("/api/fields/:fieldId", async (req, res, next) => {
   try {
     const lookupImpact = await getFieldImpact(req.params.fieldId);
@@ -1270,6 +1348,7 @@ app.post("/api/bases/:baseId/catalog-definitions", async (req, res, next) => {
       fullWidth: Boolean(req.body?.normalization?.fullWidth),
       typed: req.body?.normalization?.typed !== false,
     };
+    const indexEstimate = await ensureFieldPerformanceIndexes(tableId, uniqueFieldIds, "catalog");
     const existing = (await pool.query("SELECT * FROM catalog_definitions WHERE table_id=$1", [tableId])).rows[0];
     if (existing) {
       const configs = Number((await pool.query("SELECT count(*) value FROM catalog_match_configs WHERE definition_id=$1", [existing.id])).rows[0].value);
@@ -1289,7 +1368,7 @@ app.post("/api/bases/:baseId/catalog-definitions", async (req, res, next) => {
     )).rows[0];
     const indexed = await rebuildCatalogDefinition(row.id);
     await writeAudit({ actor: req.user.username, action: existing ? "update" : "create", objectType: "catalog_definition", objectId: row.id, details: { tableId, uniqueFieldIds }, ip: req.ip });
-    res.status(existing ? 200 : 201).json(indexed);
+    res.status(existing ? 200 : 201).json({ ...indexed, indexEstimate });
   } catch (error) { next(error); }
 });
 
@@ -1582,6 +1661,11 @@ app.post("/api/bases/:baseId/pivot-configs", async (req, res, next) => {
     const table = (await pool.query("SELECT id FROM data_tables WHERE id=$1 AND base_id=$2 AND deleted_at IS NULL", [tableId, req.params.baseId])).rows[0];
     if (!table) throw httpError(400, "请选择有效的数据表", "PIVOT_TABLE_INVALID");
     const { config } = await validatePivotConfig(tableId, req.body?.config || {});
+    const pivotFieldIds = [...new Set([
+      ...config.rows.map((item) => item.fieldId), ...config.columns.map((item) => item.fieldId),
+      ...config.measures.map((item) => item.fieldId).filter(Boolean), ...config.filters.map((item) => item.fieldId),
+    ])];
+    if (pivotFieldIds.length) await ensureFieldPerformanceIndexes(tableId, pivotFieldIds, "pivot");
     const row = (await pool.query(
       `INSERT INTO pivot_configs(base_id,table_id,name,config,created_by_user_id,created_by)
        VALUES($1,$2,$3,$4::jsonb,$5,$6) RETURNING *`,
@@ -1612,6 +1696,11 @@ app.patch("/api/pivot-configs/:configId", async (req, res, next) => {
     if (!name) throw httpError(400, "数据透视名称不能为空", "PIVOT_NAME_REQUIRED");
     const config = req.body?.config === undefined ? normalizePivotConfig(current.config, await getFields(current.table_id))
       : (await validatePivotConfig(current.table_id, req.body.config)).config;
+    const pivotFieldIds = [...new Set([
+      ...config.rows.map((item) => item.fieldId), ...config.columns.map((item) => item.fieldId),
+      ...config.measures.map((item) => item.fieldId).filter(Boolean), ...config.filters.map((item) => item.fieldId),
+    ])];
+    if (pivotFieldIds.length) await ensureFieldPerformanceIndexes(current.table_id, pivotFieldIds, "pivot");
     const row = (await pool.query(
       "UPDATE pivot_configs SET name=$2,config=$3::jsonb,updated_at=now() WHERE id=$1 RETURNING *",
       [current.id, name, JSON.stringify(config)],
@@ -1766,6 +1855,8 @@ app.use((error, _req, res, _next) => {
 });
 
 await initializeDatabase();
+await ensureCorePerformanceIndexes();
+await recoverBackgroundTasks();
 await startLookupWorker();
 await startCatalogWorker();
 await startPivotWorker();

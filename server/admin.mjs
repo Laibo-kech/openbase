@@ -8,6 +8,7 @@ import compression from "compression";
 import helmet from "helmet";
 import bcrypt from "bcryptjs";
 import { initializeDatabase, pool, writeAudit } from "./db.mjs";
+import { cancelBackgroundTask, retryBackgroundTask } from "./background-task-service.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const adminPath = path.resolve(__dirname, "../admin");
@@ -113,7 +114,7 @@ app.post("/api/auth/logout", async (req, res, next) => {
 
 app.get("/api/dashboard", async (_req, res, next) => {
   try {
-    const [counts, database, connections] = await Promise.all([
+    const [counts, database, connections, taskCounts] = await Promise.all([
       pool.query(`SELECT
         (SELECT count(*) FROM users)::int users,
         (SELECT count(*) FROM users WHERE status='active')::int active_users,
@@ -123,6 +124,9 @@ app.get("/api/dashboard", async (_req, res, next) => {
         (SELECT count(*) FROM records WHERE deleted_at IS NULL)::bigint records`),
       pool.query("SELECT pg_database_size(current_database())::bigint bytes"),
       pool.query("SELECT count(*)::int value FROM pg_stat_activity WHERE datname=current_database()"),
+      pool.query(`SELECT count(*) FILTER (WHERE status='running')::int running_tasks,
+        count(*) FILTER (WHERE status='waiting')::int waiting_tasks,
+        count(*) FILTER (WHERE status='failed')::int failed_tasks FROM background_tasks`),
     ]);
     const disk = fs.statfsSync("/");
     res.json({
@@ -136,6 +140,7 @@ app.get("/api/dashboard", async (_req, res, next) => {
       diskTotalBytes: disk.blocks * disk.bsize,
       diskFreeBytes: disk.bavail * disk.bsize,
       loadAverage: os.loadavg(),
+      ...taskCounts.rows[0],
     });
   } catch (error) { next(error); }
 });
@@ -219,6 +224,77 @@ app.get("/api/audit", async (_req, res, next) => {
   try {
     const { rows } = await pool.query("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 200");
     res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/tasks", async (req, res, next) => {
+  try {
+    const statuses = String(req.query.status || "").split(",").filter(Boolean);
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 200));
+    const { rows } = await pool.query(
+      `SELECT task.*,b.name base_name,t.name table_name,u.username account_name
+       FROM background_tasks task JOIN bases b ON b.id=task.base_id
+       JOIN data_tables t ON t.id=task.table_id
+       LEFT JOIN users u ON u.id=task.requested_by_user_id
+       WHERE ($1::text[]='{}' OR task.status=ANY($1::text[]))
+       ORDER BY task.created_at DESC LIMIT $2`,
+      [statuses, limit],
+    );
+    res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/tasks/:taskId/cancel", async (req, res, next) => {
+  try {
+    const task = await cancelBackgroundTask(req.params.taskId);
+    await writeAudit({ actor: req.admin.username, action: "admin_cancel", objectType: "background_task", objectId: task.id, ip: req.ip });
+    res.json(task);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/tasks/:taskId/retry", async (req, res, next) => {
+  try {
+    const task = await retryBackgroundTask(req.params.taskId);
+    await writeAudit({ actor: req.admin.username, action: "admin_retry", objectType: "background_task", objectId: task.id, ip: req.ip });
+    res.status(202).json(task);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/slow-tasks", async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT task.*,b.name base_name,t.name table_name
+       FROM background_tasks task JOIN bases b ON b.id=task.base_id JOIN data_tables t ON t.id=task.table_id
+       WHERE task.task_type IN ('catalog_match','pivot_calculation') AND task.duration_ms IS NOT NULL
+       ORDER BY task.duration_ms DESC LIMIT 100`,
+    );
+    res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/database-monitor", async (_req, res, next) => {
+  try {
+    const [connections, slowQueries, taskCounts, indexStates, database] = await Promise.all([
+      pool.query(`SELECT COALESCE(state,'unknown') state,count(*)::int count
+        FROM pg_stat_activity WHERE datname=current_database() GROUP BY state ORDER BY count(*) DESC`),
+      pool.query(`SELECT pid,usename,COALESCE(state,'unknown') state,
+        extract(epoch FROM (clock_timestamp()-query_start))::numeric(12,2) duration_seconds,
+        left(regexp_replace(query,'[[:space:]]+',' ','g'),240) query
+        FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()
+          AND state<>'idle' AND query_start<clock_timestamp()-interval '1 second'
+        ORDER BY query_start LIMIT 50`),
+      pool.query(`SELECT status,count(*)::int count FROM background_tasks GROUP BY status ORDER BY status`),
+      pool.query(`SELECT status,count(*)::int count,COALESCE(sum(actual_bytes),0)::bigint bytes
+        FROM field_performance_indexes GROUP BY status ORDER BY status`),
+      pool.query(`SELECT pg_database_size(current_database())::bigint database_bytes,
+        (SELECT count(*) FROM records WHERE deleted_at IS NULL)::bigint records`),
+    ]);
+    const disk = fs.statfsSync("/");
+    res.json({
+      ...database.rows[0], connections: connections.rows, slowQueries: slowQueries.rows,
+      tasks: taskCounts.rows, indexes: indexStates.rows,
+      diskTotalBytes: disk.blocks * disk.bsize, diskFreeBytes: disk.bavail * disk.bsize,
+    });
   } catch (error) { next(error); }
 });
 

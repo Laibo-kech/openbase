@@ -129,6 +129,10 @@ try {
 
   let previewJob = await request(`/api/catalog-configs/${matchConfig.id}/preview`, { method: "POST", body: { mode: "full" } }, 202);
   previewJob = await waitFor(`/api/catalog-jobs/${previewJob.id}`);
+  const catalogTasks = await request(`/api/bases/${base.id}/background-tasks?type=catalog_match&status=completed`);
+  if (!catalogTasks.some((task) => task.source_job_id === previewJob.id && Number(task.progress) === 100)) {
+    throw new Error("Catalog job was not recorded in the unified task center");
+  }
   if (Number(previewJob.matched_records) !== 2 || Number(previewJob.conflict_records) !== 1 || Number(previewJob.unmatched_records) !== 1) {
     throw new Error(`Unexpected preview metrics: ${JSON.stringify(previewJob)}`);
   }
@@ -198,7 +202,12 @@ try {
     },
   }, 201);
   let pivotJob = await request(`/api/pivot-configs/${pivot.id}/calculate`, { method: "POST", body: {} }, 202);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
   let pivotResult = await waitFor(`/api/pivot-jobs/${pivotJob.id}`);
+  const pivotTasks = await request(`/api/bases/${base.id}/background-tasks?type=pivot_calculation&status=completed`);
+  if (!pivotTasks.some((task) => task.source_job_id === pivotJob.id && Number(task.progress) === 100)) {
+    throw new Error("Pivot did not continue in the background after the page-independent delay");
+  }
   if (!pivotResult.rows.length || Number(pivotResult.job.result_rows) < 4) throw new Error("Pivot result rows are incomplete");
   const leaf = pivotResult.rows.find((row) => !row.is_total);
   if (!leaf) throw new Error("Pivot leaf result is missing");

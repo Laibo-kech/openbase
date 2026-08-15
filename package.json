@@ -1,6 +1,6 @@
 {
   "name": "multibase-v1",
-  "version": "3.0.1",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,6 +13,7 @@
     "acceptance:lookup": "node scripts/lookup-acceptance.mjs",
     "acceptance:catalog-pivot": "node scripts/catalog-pivot-acceptance.mjs",
     "acceptance:pivot-million": "node scripts/pivot-million-acceptance.mjs",
+    "acceptance:background-tasks": "node scripts/background-task-acceptance.mjs",
     "acceptance:release": "node scripts/release-smoke.mjs",
     "acceptance:admin": "node scripts/admin-acceptance.mjs",
     "acceptance:accounts": "node scripts/account-acceptance.mjs",

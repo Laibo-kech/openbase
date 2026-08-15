@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { pool, withTransaction } from "./db.mjs";
+import { claimBackgroundTask, registerBackgroundTask, syncBackgroundTask } from "./background-task-service.mjs";
 
 const AGGREGATIONS = new Set(["count", "distinct_count", "sum", "average", "max", "min"]);
 const DATE_GROUPS = new Set(["year", "quarter", "month", "week", "day"]);
@@ -250,19 +251,29 @@ export async function enqueuePivotJob({ pivotConfigId, user }) {
      ON CONFLICT(pivot_config_id) WHERE status IN ('pending','computing') DO NOTHING RETURNING *`,
     [pivotConfigId, user?.id || null, user?.username || "system", configHash, JSON.stringify(config), source.value, source.records],
   );
-  if (rows[0]) return rows[0];
-  return (await pool.query(
+  const job = rows[0] || (await pool.query(
     "SELECT * FROM pivot_jobs WHERE pivot_config_id=$1 AND status IN ('pending','computing') ORDER BY created_at DESC LIMIT 1",
     [pivotConfigId],
   )).rows[0];
+  await registerBackgroundTask({
+    baseId: pivotConfig.base_id, tableId: pivotConfig.table_id, taskType: "pivot_calculation",
+    sourceJobType: "pivot", sourceJobId: job.id, user, totalRecords: source.records,
+    metadata: { pivotConfigId, configName: pivotConfig.name, tableName: pivotConfig.table_name },
+  });
+  return job;
 }
 
 async function claimPivotJob() {
-  return withTransaction(async (client) => (await client.query(
+  const task = await claimBackgroundTask("pivot");
+  if (!task) return null;
+  const job = await withTransaction(async (client) => (await client.query(
     `UPDATE pivot_jobs SET status='computing',started_at=COALESCE(started_at,now()),progress=5
-     WHERE id=(SELECT id FROM pivot_jobs WHERE status='pending' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+     WHERE id=$1 AND status IN ('pending','computing')
      RETURNING *`,
+    [task.source_job_id],
   )).rows[0]);
+  if (!job) await syncBackgroundTask("pivot", task.source_job_id, { status: "failed", errorMessage: "来源任务不存在或状态无效" });
+  return job;
 }
 
 async function insertPivotRows(job, rows, config) {
@@ -296,6 +307,10 @@ async function insertPivotRows(job, rows, config) {
       "UPDATE pivot_jobs SET progress=$2,result_rows=$3 WHERE id=$1",
       [job.id, Math.min(96, 80 + Math.round(((start + batch.length) / Math.max(filtered.length, 1)) * 16)), start + batch.length],
     );
+    await syncBackgroundTask("pivot", job.id, {
+      status: "computing", totalRecords: job.source_records, processedRecords: job.source_records,
+      progress: Math.min(96, 80 + Math.round(((start + batch.length) / Math.max(filtered.length, 1)) * 16)),
+    });
   }
   return filtered.length;
 }
@@ -312,6 +327,7 @@ async function processPivotJob(job) {
   try {
     const pid = (await client.query("SELECT pg_backend_pid() value")).rows[0].value;
     await pool.query("UPDATE pivot_jobs SET backend_pid=$2,progress=10 WHERE id=$1", [job.id, pid]);
+    await syncBackgroundTask("pivot", job.id, { status: "computing", totalRecords: job.source_records, progress: 10 });
     await client.query("BEGIN");
     await client.query(`SET LOCAL statement_timeout='${Number(process.env.PIVOT_STATEMENT_TIMEOUT_MS || 300000)}ms'`);
     result = await client.query(query.sql, query.params);
@@ -327,6 +343,9 @@ async function processPivotJob(job) {
   }
   await pool.query("DELETE FROM pivot_job_rows WHERE job_id=$1", [job.id]);
   await pool.query("UPDATE pivot_jobs SET progress=80,processed_records=source_records WHERE id=$1", [job.id]);
+  await syncBackgroundTask("pivot", job.id, {
+    status: "computing", totalRecords: job.source_records, processedRecords: job.source_records, progress: 80,
+  });
   const rowCount = await insertPivotRows(job, result.rows, config);
   const current = (await pool.query("SELECT status FROM pivot_jobs WHERE id=$1", [job.id])).rows[0];
   if (current?.status === "cancelled") return;
@@ -340,6 +359,9 @@ async function processPivotJob(job) {
        WHERE id=$1`,
       [job.pivot_config_id, job.id, job.source_version],
     );
+  });
+  await syncBackgroundTask("pivot", job.id, {
+    status: "completed", totalRecords: job.source_records, processedRecords: job.source_records, progress: 100,
   });
 }
 
@@ -357,16 +379,13 @@ async function pivotWorkerTick() {
       `UPDATE pivot_jobs SET status='failed',backend_pid=NULL,error_message=$2,completed_at=now() WHERE id=$1 AND status<>'cancelled'`,
       [active.id, String(error.message || error).slice(0, 1000)],
     );
+    if (active) await syncBackgroundTask("pivot", active.id, { status: "failed", errorMessage: String(error.message || error).slice(0, 1000) });
   } finally {
     workerBusy = false;
   }
 }
 
 export async function startPivotWorker() {
-  await pool.query(
-    `UPDATE pivot_jobs SET status='failed',backend_pid=NULL,error_message='服务重启导致任务中断，可重新计算',completed_at=now()
-     WHERE status='computing'`,
-  );
   const timer = setInterval(pivotWorkerTick, Number(process.env.PIVOT_WORKER_INTERVAL_MS || 700));
   timer.unref();
   pivotWorkerTick();
@@ -379,6 +398,9 @@ export async function cancelPivotJob(jobId) {
   }
   await pool.query("UPDATE pivot_jobs SET status='cancelled',completed_at=now(),progress=0 WHERE id=$1", [jobId]);
   if (job.backend_pid) await pool.query("SELECT pg_cancel_backend($1)", [job.backend_pid]);
+  await syncBackgroundTask("pivot", jobId, {
+    status: "cancelled", totalRecords: job.source_records, processedRecords: job.processed_records, progress: 100,
+  });
   return { ...job, status: "cancelled" };
 }
 

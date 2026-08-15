@@ -17,7 +17,7 @@ services:
 
   app:
     build: .
-    image: multibase-v1:2.0.0
+    image: multibase-v1:3.1.0
     restart: unless-stopped
     env_file: .env
     environment:
@@ -41,7 +41,7 @@ services:
 
   admin:
     build: .
-    image: multibase-v1:2.0.0
+    image: multibase-v1:3.1.0
     command: ["node", "server/admin.mjs"]
     restart: unless-stopped
     env_file: .env

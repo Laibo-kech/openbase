@@ -1,5 +1,6 @@
 import { pool, withTransaction } from "./db.mjs";
 import { enqueueDirtyLookupJobs, markLookupsDirtyForSource } from "./lookup-service.mjs";
+import { claimBackgroundTask, registerBackgroundTask, syncBackgroundTask } from "./background-task-service.mjs";
 
 const DEFAULT_NORMALIZATION = Object.freeze({
   trim: true,
@@ -293,20 +294,29 @@ export async function enqueueCatalogPreview({ configId, mode = "full", user }) {
      ON CONFLICT(config_id) WHERE status IN ('pending','computing','paused') DO NOTHING RETURNING *`,
     [configId, user?.id || null, user?.username || "system", mode, sourceCount, JSON.stringify(rules)],
   );
-  if (rows[0]) return rows[0];
-  return (await pool.query(
+  const job = rows[0] || (await pool.query(
     "SELECT * FROM catalog_match_jobs WHERE config_id=$1 AND status IN ('pending','computing','paused') ORDER BY created_at DESC LIMIT 1",
     [configId],
   )).rows[0];
+  await registerBackgroundTask({
+    baseId: config.base_id, tableId: config.source_table_id, taskType: "catalog_match",
+    sourceJobType: "catalog", sourceJobId: job.id, user, totalRecords: sourceCount,
+    metadata: { mode, stage: "preview", configId, configName: config.name, tableName: config.source_table_name },
+  });
+  return job;
 }
 
 async function claimCatalogJob() {
-  return withTransaction(async (client) => (await client.query(
+  const task = await claimBackgroundTask("catalog");
+  if (!task) return null;
+  const job = await withTransaction(async (client) => (await client.query(
     `UPDATE catalog_match_jobs SET status='computing',started_at=COALESCE(started_at,now())
-     WHERE id=(SELECT id FROM catalog_match_jobs WHERE status IN ('pending','computing')
-       ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+     WHERE id=$1 AND status IN ('pending','computing')
      RETURNING *`,
+    [task.source_job_id],
   )).rows[0]);
+  if (!job) await syncBackgroundTask("catalog", task.source_job_id, { status: "failed", errorMessage: "来源任务不存在或状态无效" });
+  return job;
 }
 
 async function loadSourceBatch(job, config) {
@@ -561,14 +571,24 @@ async function processCatalogJob(job) {
         [job.id, config.id],
       );
     } else {
-      await updateJobMetrics(job.id, job.last_record_id);
+      const metrics = await updateJobMetrics(job.id, job.last_record_id);
       await pool.query("UPDATE catalog_match_jobs SET status='completed',completed_at=now() WHERE id=$1", [job.id]);
+      await syncBackgroundTask("catalog", job.id, {
+        status: "completed", totalRecords: job.total_records, processedRecords: metrics.processed, failedRecords: 0,
+      });
     }
+    if (job.stage === "apply") await syncBackgroundTask("catalog", job.id, {
+      status: "completed", totalRecords: job.total_records, processedRecords: job.total_records, failedRecords: 0,
+    });
     return;
   }
   if (job.stage === "apply") await applyBatch(job, config, records);
   else await previewBatch(job, config, records);
-  await updateJobMetrics(job.id, records.at(-1).id);
+  const metrics = await updateJobMetrics(job.id, records.at(-1).id);
+  const state = (await pool.query("SELECT status FROM catalog_match_jobs WHERE id=$1", [job.id])).rows[0]?.status;
+  await syncBackgroundTask("catalog", job.id, {
+    status: state || "computing", totalRecords: job.total_records, processedRecords: metrics.processed, failedRecords: 0,
+  });
 }
 
 let workerBusy = false;
@@ -585,16 +605,13 @@ async function catalogWorkerTick() {
       "UPDATE catalog_match_jobs SET status='failed',error_message=$2,completed_at=now() WHERE id=$1",
       [active.id, String(error.message || error).slice(0, 1000)],
     );
+    if (active) await syncBackgroundTask("catalog", active.id, { status: "failed", errorMessage: String(error.message || error).slice(0, 1000) });
   } finally {
     workerBusy = false;
   }
 }
 
 export async function startCatalogWorker() {
-  await pool.query(
-    `UPDATE catalog_match_jobs SET status='failed',error_message='服务重启导致任务中断，可重新执行',completed_at=now()
-     WHERE status='computing'`,
-  );
   const timer = setInterval(catalogWorkerTick, Number(process.env.CATALOG_WORKER_INTERVAL_MS || 600));
   timer.unref();
   catalogWorkerTick();
@@ -616,6 +633,10 @@ export async function setCatalogJobAction(jobId, action) {
     [jobId, transition.to, transition.from],
   );
   if (!rows.length) throw catalogError("当前任务状态不能执行该操作", "CATALOG_JOB_STATE_INVALID", 409);
+  await syncBackgroundTask("catalog", jobId, {
+    status: rows[0].status, totalRecords: rows[0].total_records,
+    processedRecords: rows[0].processed_records, failedRecords: 0,
+  });
   return rows[0];
 }
 
@@ -628,6 +649,9 @@ export async function startCatalogApply(jobId) {
     [jobId],
   );
   if (!rows.length) throw catalogError("只有已完成的匹配预览可以正式应用", "CATALOG_PREVIEW_NOT_READY", 409);
+  if (rows[0]) await syncBackgroundTask("catalog", jobId, {
+    status: "pending", totalRecords: rows[0].total_records, processedRecords: 0, failedRecords: 0,
+  });
   return rows[0];
 }
 

@@ -186,6 +186,9 @@ CREATE TABLE IF NOT EXISTS lookup_jobs (
   started_at timestamptz,
   completed_at timestamptz
 );
+ALTER TABLE lookup_jobs DROP CONSTRAINT IF EXISTS lookup_jobs_status_check;
+ALTER TABLE lookup_jobs ADD CONSTRAINT lookup_jobs_status_check
+  CHECK (status IN ('pending','computing','completed','partial','failed','cancelled'));
 DROP INDEX IF EXISTS lookup_jobs_one_active_field_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS lookup_jobs_one_active_mode_idx
   ON lookup_jobs(lookup_field_id,mode) WHERE status IN ('pending','computing');
@@ -403,6 +406,78 @@ CREATE TABLE IF NOT EXISTS pivot_job_rows (
   PRIMARY KEY (job_id, row_index)
 );
 CREATE INDEX IF NOT EXISTS pivot_job_rows_page_idx ON pivot_job_rows(job_id, row_index);
+
+CREATE TABLE IF NOT EXISTS background_tasks (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  base_id uuid NOT NULL REFERENCES bases(id) ON DELETE CASCADE,
+  table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  task_type text NOT NULL CHECK (task_type IN ('lookup_recalculation','catalog_match','pivot_calculation')),
+  source_job_type text NOT NULL CHECK (source_job_type IN ('lookup','catalog','pivot')),
+  source_job_id uuid NOT NULL,
+  conflict_key text NOT NULL,
+  status text NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting','running','completed','partial_success','failed','cancelled','interrupted')),
+  requested_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  requested_by text NOT NULL,
+  total_records bigint NOT NULL DEFAULT 0,
+  processed_records bigint NOT NULL DEFAULT 0,
+  failed_records bigint NOT NULL DEFAULT 0,
+  progress integer NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
+  attempt integer NOT NULL DEFAULT 1,
+  recovery_count integer NOT NULL DEFAULT 0,
+  cancel_requested boolean NOT NULL DEFAULT false,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  heartbeat_at timestamptz,
+  completed_at timestamptz,
+  duration_ms bigint
+);
+CREATE UNIQUE INDEX IF NOT EXISTS background_tasks_source_unique
+  ON background_tasks(source_job_type,source_job_id);
+CREATE INDEX IF NOT EXISTS background_tasks_queue_idx
+  ON background_tasks(status,created_at);
+CREATE INDEX IF NOT EXISTS background_tasks_base_idx
+  ON background_tasks(base_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS background_tasks_table_idx
+  ON background_tasks(table_id,status,created_at DESC);
+CREATE INDEX IF NOT EXISTS background_tasks_slow_idx
+  ON background_tasks(task_type,duration_ms DESC NULLS LAST) WHERE status IN ('completed','partial_success','failed');
+
+CREATE TABLE IF NOT EXISTS performance_events (
+  id bigserial PRIMARY KEY,
+  background_task_id uuid REFERENCES background_tasks(id) ON DELETE SET NULL,
+  operation text NOT NULL,
+  base_id uuid REFERENCES bases(id) ON DELETE CASCADE,
+  table_id uuid REFERENCES data_tables(id) ON DELETE CASCADE,
+  duration_ms bigint NOT NULL DEFAULT 0,
+  processed_records bigint NOT NULL DEFAULT 0,
+  success boolean NOT NULL DEFAULT true,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS performance_events_operation_idx
+  ON performance_events(operation,created_at DESC);
+CREATE INDEX IF NOT EXISTS performance_events_slow_idx
+  ON performance_events(duration_ms DESC,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS field_performance_indexes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  field_id uuid NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
+  purpose text NOT NULL CHECK (purpose IN ('catalog','pivot','relation')),
+  index_name text NOT NULL UNIQUE,
+  status text NOT NULL DEFAULT 'estimated' CHECK (status IN ('estimated','building','ready','failed')),
+  estimated_bytes bigint NOT NULL DEFAULT 0,
+  estimated_seconds integer NOT NULL DEFAULT 0,
+  actual_bytes bigint,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz,
+  UNIQUE(table_id,field_id,purpose)
+);
+CREATE INDEX IF NOT EXISTS field_performance_indexes_status_idx
+  ON field_performance_indexes(status,created_at);
 
 CREATE TABLE IF NOT EXISTS import_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

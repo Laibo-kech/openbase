@@ -51,6 +51,9 @@ th { height: 42px; color: #646a73; background: #fafbfc; font-size: 12px; font-we
 tr:last-child td { border-bottom: 0; }
 .status { display: inline-flex; align-items: center; height: 24px; padding: 0 8px; border-radius: 3px; color: #176b5b; background: #e8f3f0; font-size: 11px; }
 .status.disabled { color: #c43a3a; background: #fdeeee; }
+.admin-progress { position: relative; width: 120px; height: 22px; overflow: hidden; border-radius: 3px; background: #eff0f2; }
+.admin-progress i { position: absolute; inset: 0 auto 0 0; background: #cfe9e2; }.admin-progress span { position: relative; z-index: 1; padding-left: 7px; line-height: 22px; font-size: 10px; }
+td code { display: block; max-width: 560px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px ui-monospace,monospace; }
 .actions { display: flex; gap: 6px; }
 .actions button { height: 30px; padding: 0 9px; font-size: 12px; }
 .muted { color: #8f959e; }

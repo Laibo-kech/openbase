@@ -90,6 +90,8 @@ try {
   if (!Array.isArray(recordPage.records) || !Array.isArray(recordPage.fields)) {
     throw new Error("Record API response is incomplete");
   }
+  const userTasks = await request(appBaseUrl, `/api/bases/${primaryBases[0].id}/background-tasks?limit=10`, primaryCookie);
+  if (!Array.isArray(userTasks)) throw new Error("User task center response is incomplete");
 
   const secondaryBases = await request(appBaseUrl, "/api/bases", secondaryCookie);
   if (secondaryBases.some((base) => base.id === primaryBases[0].id)) {
@@ -101,13 +103,17 @@ try {
   if (!adminHealth.ok || adminHealth.database !== "connected") throw new Error("Admin health check failed");
   await request(adminBaseUrl, "/api/dashboard", "", 401);
   const adminCookie = await issueAdminSession();
-  const [dashboard, adminUsers, projects, audit] = await Promise.all([
+  const [dashboard, adminUsers, projects, tasks, slowTasks, databaseMonitor, audit] = await Promise.all([
     request(adminBaseUrl, "/api/dashboard", adminCookie),
     request(adminBaseUrl, "/api/users", adminCookie),
     request(adminBaseUrl, "/api/projects", adminCookie),
+    request(adminBaseUrl, "/api/tasks?limit=10", adminCookie),
+    request(adminBaseUrl, "/api/slow-tasks", adminCookie),
+    request(adminBaseUrl, "/api/database-monitor", adminCookie),
     request(adminBaseUrl, "/api/audit", adminCookie),
   ]);
-  if (!Array.isArray(adminUsers) || !Array.isArray(projects) || !Array.isArray(audit)) {
+  if (!Array.isArray(adminUsers) || !Array.isArray(projects) || !Array.isArray(tasks)
+    || !Array.isArray(slowTasks) || !Array.isArray(databaseMonitor.connections) || !Array.isArray(audit)) {
     throw new Error("Admin API response is incomplete");
   }
   if (Number(dashboard.users) !== before.users || Number(dashboard.bases) !== before.bases
@@ -136,6 +142,9 @@ try {
     isolationStatus: 404,
     adminUsers: adminUsers.length,
     adminProjects: projects.length,
+    backgroundTasks: tasks.length,
+    slowTasks: slowTasks.length,
+    databaseConnections: databaseMonitor.connections.reduce((sum, item) => sum + Number(item.count), 0),
     auditRows: audit.length,
   }));
 } finally {

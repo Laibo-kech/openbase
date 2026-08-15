@@ -19,7 +19,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { api, formatNumber } from "./api.js";
+import { api, formatBytes, formatNumber } from "./api.js";
 
 const NORMALIZATION_DEFAULT = {
   trim: true,
@@ -102,7 +102,16 @@ function DefinitionEditor({ base, tables, schemas, existing, onClose, onSaved })
   const [normalization, setNormalization] = useState({ ...NORMALIZATION_DEFAULT, ...(existing?.normalization || {}) });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [indexEstimate, setIndexEstimate] = useState(null);
   const fields = (schemas[tableId]?.fields || []).filter((field) => field.type !== "lookup");
+  useEffect(() => {
+    setIndexEstimate(null);
+    if (!tableId || !fieldIds.length) return undefined;
+    const timer = setTimeout(() => api(`/tables/${tableId}/index-estimate`, {
+      method: "POST", body: { fieldIds, purpose: "catalog" },
+    }).then(setIndexEstimate).catch(() => setIndexEstimate(null)), 250);
+    return () => clearTimeout(timer);
+  }, [tableId, fieldIds.join(",")]);
   async function save(confirmImpact = false) {
     setSaving(true); setError("");
     try {
@@ -129,6 +138,7 @@ function DefinitionEditor({ base, tables, schemas, existing, onClose, onSaved })
             ["trim", "忽略首尾空格"], ["collapseSpaces", "合并连续空格"], ["caseInsensitive", "忽略英文大小写"], ["fullWidth", "忽略全角半角"], ["typed", "标准化数字和日期"],
           ].map(([key, label]) => <ToggleLine key={key} checked={normalization[key]} onChange={(checked) => setNormalization({ ...normalization, [key]: checked })}>{label}</ToggleLine>)}</div>
         </div>
+        {indexEstimate && <div className="index-estimate"><div><span>预计记录</span><strong>{formatNumber(indexEstimate.records)}</strong></div><div><span>预计索引空间</span><strong>{formatBytes(indexEstimate.estimatedBytes)}</strong></div><div><span>预计建立时间</span><strong>约 {indexEstimate.estimatedSeconds} 秒</strong></div><small>采用并发建立索引，期间仍可浏览和编辑数据。</small></div>}
         {error && <Notice type="error">{error}</Notice>}
       </div>
     </FeatureModal>

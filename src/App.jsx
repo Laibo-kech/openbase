@@ -20,6 +20,7 @@ import {
   Grid2X2,
   HelpCircle,
   LoaderCircle,
+  ListTodo,
   LogOut,
   Pencil,
   Plus,
@@ -36,6 +37,7 @@ import {
 import { api, formatBytes, formatNumber, publicPath } from "./api.js";
 import CatalogMatching from "./CatalogMatching.jsx";
 import PivotPage from "./PivotPage.jsx";
+import BackgroundTaskCenter from "./BackgroundTaskCenter.jsx";
 
 const fieldTypes = [
   ["text", "文本"],
@@ -549,6 +551,13 @@ function Sidebar({
       >
         <ChartNoAxesCombined size={14} />
         数据透视
+      </button>
+      <button
+        className={`nav-item ${section === "tasks" ? "active" : ""}`}
+        onClick={() => onSection("tasks")}
+      >
+        <ListTodo size={14} />
+        任务中心
       </button>
       <button
         className={`nav-item ${section === "imports" ? "active" : ""}`}
@@ -2275,6 +2284,8 @@ function BaseApp({ user, initialBase, onBack, onLogout }) {
         <CatalogMatching base={base} tables={tables} />
       ) : section === "pivot" ? (
         <PivotPage base={base} tables={tables} />
+      ) : section === "tasks" ? (
+        <BackgroundTaskCenter base={base} />
       ) : section === "exports" ? (
         <Exports base={base} tables={tables} />
       ) : section === "recycle" ? (

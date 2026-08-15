@@ -1,4 +1,5 @@
 import { pool } from "./db.mjs";
+import { claimBackgroundTask, registerBackgroundTask, syncBackgroundTask } from "./background-task-service.mjs";
 
 export const LOOKUP_RETURN_TYPES = new Set(["text", "number", "date", "select"]);
 export const LOOKUP_AGGREGATIONS = new Set([
@@ -172,11 +173,22 @@ export async function enqueueLookupJob({ lookupFieldId, mode = "incremental", us
      RETURNING *`,
     [lookupFieldId, user?.id || null, user?.username || "system", mode, total],
   )).rows[0];
-  if (inserted) return inserted;
-  return (await client.query(
+  const job = inserted || (await client.query(
     "SELECT * FROM lookup_jobs WHERE lookup_field_id=$1 AND mode=$2 AND status IN ('pending','computing') ORDER BY created_at DESC LIMIT 1",
     [lookupFieldId, mode],
   )).rows[0];
+  const context = (await client.query(
+    `SELECT d.source_table_id table_id,t.base_id,f.name field_name,t.name table_name
+     FROM lookup_dependencies d JOIN fields f ON f.id=d.lookup_field_id
+     JOIN data_tables t ON t.id=d.source_table_id WHERE d.lookup_field_id=$1`,
+    [lookupFieldId],
+  )).rows[0];
+  if (job && context) await registerBackgroundTask({
+    baseId: context.base_id, tableId: context.table_id, taskType: "lookup_recalculation",
+    sourceJobType: "lookup", sourceJobId: job.id, user, totalRecords: total,
+    metadata: { mode, fieldId: lookupFieldId, fieldName: context.field_name, tableName: context.table_name }, client,
+  });
+  return job;
 }
 
 export async function enqueueDirtyLookupJobs(client, lookupFieldIds, user) {
@@ -355,11 +367,16 @@ async function loadDefinition(lookupFieldId) {
 }
 
 async function claimJob() {
-  return (await pool.query(
+  const task = await claimBackgroundTask("lookup");
+  if (!task) return null;
+  const job = (await pool.query(
     `UPDATE lookup_jobs SET status='computing',started_at=COALESCE(started_at,now())
-     WHERE id=(SELECT id FROM lookup_jobs WHERE status='pending' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+     WHERE id=$1 AND status IN ('pending','computing')
      RETURNING *`,
+    [task.source_job_id],
   )).rows[0];
+  if (!job) await syncBackgroundTask("lookup", task.source_job_id, { status: "failed", errorMessage: "来源任务不存在或状态无效" });
+  return job;
 }
 
 async function nextSourceIds(job, definition) {
@@ -454,6 +471,11 @@ async function processJob(job) {
     let failed = Number(job.failed_records || 0);
     let lastRecordId = Number(job.last_record_id || 0);
     while (true) {
+      const state = (await pool.query("SELECT status FROM lookup_jobs WHERE id=$1", [job.id])).rows[0];
+      if (state?.status === "cancelled") {
+        await syncBackgroundTask("lookup", job.id, { status: "cancelled", processedRecords: processed, failedRecords: failed });
+        return;
+      }
       const sourceIds = await nextSourceIds({ ...job, last_record_id: lastRecordId }, definition);
       if (!sourceIds.length) break;
       const batch = await calculateBatch(job, definition, sourceIds);
@@ -466,6 +488,9 @@ async function processJob(job) {
          WHERE id=$1`,
         [job.id, processed, success, failed, lastRecordId],
       );
+      await syncBackgroundTask("lookup", job.id, {
+        status: "computing", totalRecords: job.total_records, processedRecords: processed, failedRecords: failed,
+      });
       await new Promise((resolve) => setImmediate(resolve));
     }
     const status = failed && success ? "partial" : failed ? "failed" : "completed";
@@ -474,6 +499,9 @@ async function processJob(job) {
        completed_at=now() WHERE id=$1`,
       [job.id, status, processed, success, failed],
     );
+    await syncBackgroundTask("lookup", job.id, {
+      status, totalRecords: job.total_records, processedRecords: processed, failedRecords: failed,
+    });
     if (job.mode !== "incremental") {
       const dirty = Number((await pool.query(
         "SELECT count(*) value FROM lookup_dirty_records WHERE lookup_field_id=$1",
@@ -492,6 +520,7 @@ async function processJob(job) {
       "UPDATE lookup_jobs SET status='failed',error_message=$2,completed_at=now() WHERE id=$1",
       [job.id, error.message],
     );
+    await syncBackgroundTask("lookup", job.id, { status: "failed", errorMessage: error.message });
   }
 }
 
@@ -510,10 +539,6 @@ async function workerTick() {
 }
 
 export async function startLookupWorker() {
-  await pool.query(
-    `UPDATE lookup_jobs SET status='failed',error_message='服务重启导致任务中断，可重新执行',completed_at=now()
-     WHERE status='computing'`,
-  );
   const timer = setInterval(workerTick, Number(process.env.LOOKUP_WORKER_INTERVAL_MS || 700));
   timer.unref();
   workerTick();
