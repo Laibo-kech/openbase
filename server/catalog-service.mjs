@@ -303,7 +303,8 @@ export async function enqueueCatalogPreview({ configId, mode = "full", user }) {
 async function claimCatalogJob() {
   return withTransaction(async (client) => (await client.query(
     `UPDATE catalog_match_jobs SET status='computing',started_at=COALESCE(started_at,now())
-     WHERE id=(SELECT id FROM catalog_match_jobs WHERE status='pending' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+     WHERE id=(SELECT id FROM catalog_match_jobs WHERE status IN ('pending','computing')
+       ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
      RETURNING *`,
   )).rows[0]);
 }
