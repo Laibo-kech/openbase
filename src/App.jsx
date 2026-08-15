@@ -4,6 +4,8 @@ import {
   ArrowDownToLine,
   ArrowLeft,
   ArrowUpFromLine,
+  BookOpenCheck,
+  ChartNoAxesCombined,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -32,6 +34,8 @@ import {
   X,
 } from "lucide-react";
 import { api, formatBytes, formatNumber, publicPath } from "./api.js";
+import CatalogMatching from "./CatalogMatching.jsx";
+import PivotPage from "./PivotPage.jsx";
 
 const fieldTypes = [
   ["text", "文本"],
@@ -532,6 +536,20 @@ function Sidebar({
         新建数据表
       </button>
       <span className="nav-label tools">工具</span>
+      <button
+        className={`nav-item ${section === "catalog" ? "active" : ""}`}
+        onClick={() => onSection("catalog")}
+      >
+        <BookOpenCheck size={14} />
+        匹配目录
+      </button>
+      <button
+        className={`nav-item ${section === "pivot" ? "active" : ""}`}
+        onClick={() => onSection("pivot")}
+      >
+        <ChartNoAxesCombined size={14} />
+        数据透视
+      </button>
       <button
         className={`nav-item ${section === "imports" ? "active" : ""}`}
         onClick={() => onSection("imports")}
@@ -2253,6 +2271,10 @@ function BaseApp({ user, initialBase, onBack, onLogout }) {
         />
       ) : section === "imports" ? (
         <Imports base={base} tables={tables} onChanged={loadTables} />
+      ) : section === "catalog" ? (
+        <CatalogMatching base={base} tables={tables} />
+      ) : section === "pivot" ? (
+        <PivotPage base={base} tables={tables} />
       ) : section === "exports" ? (
         <Exports base={base} tables={tables} />
       ) : section === "recycle" ? (

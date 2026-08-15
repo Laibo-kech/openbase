@@ -207,9 +207,15 @@ function buildPivotQuery(tableId, config, fields, maxRows) {
   if (columnExpressions.length) groups.push(`ROLLUP(${columnExpressions.join(",")})`);
   const limit = builder.param(maxRows + 1);
   const selectList = [...selections, ...measureSelections, `${rowGrouping} row_grouping`, `${columnGrouping} column_grouping`];
+  const direction = config.sort.direction === "desc" ? "DESC" : "ASC";
+  let sortedMeasure = config.measures.findIndex((measure) => measure.id === config.sort.by);
+  if (config.sort.by === "count") sortedMeasure = config.measures.findIndex((measure) => measure.aggregation === "count");
+  const detailSort = sortedMeasure >= 0
+    ? `,m${sortedMeasure} ${direction} NULLS LAST`
+    : dimensions.length ? `,${dimensions.map((_, index) => `d${index} ${direction} NULLS LAST`).join(",")}` : "";
   const sql = `SELECT ${selectList.join(",")} FROM records r WHERE ${where.join(" AND ")}
     ${groups.length ? `GROUP BY ${groups.join(",")}` : ""}
-    ORDER BY row_grouping DESC,column_grouping DESC${dimensions.length ? `,${dimensions.map((_, index) => `d${index} NULLS LAST`).join(",")}` : ""}
+    ORDER BY row_grouping DESC,column_grouping DESC${detailSort}
     LIMIT ${limit}`;
   return { sql, params: builder.params };
 }

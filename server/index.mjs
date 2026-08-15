@@ -1385,7 +1385,16 @@ app.post("/api/bases/:baseId/catalog-configs", async (req, res, next) => {
 
 app.get("/api/catalog-configs/:configId", async (req, res, next) => {
   try {
-    const config = await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    const config = (await pool.query(
+      `SELECT c.*,d.table_id catalog_table_id,d.index_status,d.duplicate_groups,
+       source.name source_table_name,target.name catalog_table_name,
+       (SELECT count(*)::bigint FROM catalog_dirty_records dirty WHERE dirty.config_id=c.id) dirty_records
+       FROM catalog_match_configs c JOIN catalog_definitions d ON d.id=c.definition_id
+       JOIN data_tables source ON source.id=c.source_table_id AND source.deleted_at IS NULL
+       JOIN data_tables target ON target.id=d.table_id AND target.deleted_at IS NULL WHERE c.id=$1`,
+      [req.params.configId],
+    )).rows[0];
     const [rules, jobs, aliases] = await Promise.all([
       pool.query("SELECT * FROM catalog_match_rules WHERE config_id=$1 ORDER BY priority", [config.id]),
       pool.query("SELECT * FROM catalog_match_jobs WHERE config_id=$1 ORDER BY created_at DESC LIMIT 30", [config.id]),
@@ -1585,7 +1594,12 @@ app.post("/api/bases/:baseId/pivot-configs", async (req, res, next) => {
 
 app.get("/api/pivot-configs/:configId", async (req, res, next) => {
   try {
-    const config = await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    const config = (await pool.query(
+      `SELECT p.*,t.name table_name FROM pivot_configs p
+       JOIN data_tables t ON t.id=p.table_id AND t.deleted_at IS NULL WHERE p.id=$1`,
+      [req.params.configId],
+    )).rows[0];
     const jobs = (await pool.query("SELECT * FROM pivot_jobs WHERE pivot_config_id=$1 ORDER BY created_at DESC LIMIT 30", [config.id])).rows;
     res.json({ ...(await getPivotConfigState(config)), jobs });
   } catch (error) { next(error); }
