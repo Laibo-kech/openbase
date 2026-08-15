@@ -374,20 +374,7 @@ async function previewBatch(job, config, records) {
       signatures.set(String(record.id), makeCatalogKey(record.values, sourceFieldMap, rules[0].source_field_ids.map(String), rules[0].normalization));
     }
   }
-  const aliases = signatures.size ? (await pool.query(
-    `SELECT source_signature,target_record_id FROM catalog_aliases
-     WHERE config_id=$1 AND source_signature=ANY($2::text[])`,
-    [config.id, [...new Set(signatures.values())]],
-  )).rows : [];
-  const aliasMap = new Map(aliases.map((row) => [row.source_signature, String(row.target_record_id)]));
   const outcomes = new Map();
-  for (const record of records) {
-    const id = String(record.id);
-    const signature = signatures.get(id) || "";
-    if (aliasMap.has(signature)) {
-      outcomes.set(id, { status: "matched", targetId: aliasMap.get(signature), candidates: [], method: "alias", signature, ruleId: null });
-    }
-  }
 
   for (const rule of rules) {
     const remaining = records.filter((record) => !outcomes.has(String(record.id)));
@@ -396,9 +383,24 @@ async function previewBatch(job, config, records) {
       String(record.id),
       makeCatalogKey(record.values, sourceFieldMap, rule.source_field_ids.map(String), rule.normalization),
     ]));
+    const aliases = (await pool.query(
+      `SELECT source_signature,target_record_id FROM catalog_aliases
+       WHERE config_id=$1 AND source_signature=ANY($2::text[])`,
+      [config.id, [...new Set(keyBySource.values())]],
+    )).rows;
+    const aliasMap = new Map(aliases.map((row) => [row.source_signature, String(row.target_record_id)]));
+    for (const record of remaining) {
+      const id = String(record.id);
+      const signature = keyBySource.get(id);
+      if (aliasMap.has(signature)) {
+        outcomes.set(id, { status: "matched", targetId: aliasMap.get(signature), candidates: [], method: "alias", signature, ruleId: rule.id });
+      }
+    }
+    const unresolved = remaining.filter((record) => !outcomes.has(String(record.id)));
+    if (!unresolved.length) continue;
     if (rule.fuzzy) {
       const candidates = await fuzzyCandidates(rule, keyBySource);
-      for (const record of remaining) {
+      for (const record of unresolved) {
         const id = String(record.id);
         const ids = candidates.get(id) || [];
         if (ids.length) outcomes.set(id, { status: "conflict", targetId: null, candidates: ids, method: "fuzzy_candidate", signature: keyBySource.get(id), ruleId: rule.id });
@@ -406,7 +408,7 @@ async function previewBatch(job, config, records) {
       continue;
     }
     const matches = await exactCandidates(rule, keyBySource);
-    for (const record of remaining) {
+    for (const record of unresolved) {
       const id = String(record.id);
       const ids = matches.get(keyBySource.get(id)) || [];
       if (ids.length === 1) outcomes.set(id, { status: "matched", targetId: ids[0], candidates: ids, method: "exact", signature: keyBySource.get(id), ruleId: rule.id });
