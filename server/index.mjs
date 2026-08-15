@@ -27,6 +27,31 @@ import {
   syncRecordRelations,
   validateAggregation,
 } from "./lookup-service.mjs";
+import {
+  catalogFieldImpact,
+  confirmCatalogResult,
+  enqueueCatalogPreview,
+  getCatalogDuplicates,
+  markCatalogDirtyForSource,
+  markCatalogStaleForTarget,
+  rebuildCatalogDefinition,
+  setCatalogJobAction,
+  startCatalogApply,
+  startCatalogWorker,
+  undoCatalogJob,
+} from "./catalog-service.mjs";
+import {
+  cancelPivotJob,
+  enqueuePivotJob,
+  estimatePivotExport,
+  getPivotConfigState,
+  getPivotDrilldown,
+  getPivotRows,
+  normalizePivotConfig,
+  pivotFieldImpact,
+  startPivotWorker,
+  validatePivotConfig,
+} from "./pivot-service.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distPath = path.resolve(__dirname, "../dist");
@@ -204,6 +229,65 @@ async function getFields(tableId, includeDeleted = false, client = pool) {
     [tableId],
   );
   return rows;
+}
+
+async function assertOwnedBase(baseId, userId, client = pool) {
+  const base = (await client.query(
+    "SELECT * FROM bases WHERE id=$1 AND owner_user_id=$2 AND deleted_at IS NULL",
+    [baseId, userId],
+  )).rows[0];
+  if (!base) throw httpError(404, "项目不存在或无权访问", "BASE_NOT_FOUND");
+  return base;
+}
+
+async function assertOwnedCatalogDefinition(definitionId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT d.* FROM catalog_definitions d JOIN bases b ON b.id=d.base_id
+     WHERE d.id=$1 AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [definitionId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "目录表定义不存在或无权访问", "CATALOG_DEFINITION_NOT_FOUND");
+  return row;
+}
+
+async function assertOwnedCatalogConfig(configId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT c.* FROM catalog_match_configs c JOIN bases b ON b.id=c.base_id
+     WHERE c.id=$1 AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [configId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "目录匹配方案不存在或无权访问", "CATALOG_CONFIG_NOT_FOUND");
+  return row;
+}
+
+async function assertOwnedCatalogJob(jobId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT j.* FROM catalog_match_jobs j JOIN catalog_match_configs c ON c.id=j.config_id
+     JOIN bases b ON b.id=c.base_id WHERE j.id=$1 AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [jobId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "目录匹配任务不存在或无权访问", "CATALOG_JOB_NOT_FOUND");
+  return row;
+}
+
+async function assertOwnedPivotConfig(configId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT p.* FROM pivot_configs p JOIN bases b ON b.id=p.base_id
+     WHERE p.id=$1 AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [configId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "数据透视方案不存在或无权访问", "PIVOT_CONFIG_NOT_FOUND");
+  return row;
+}
+
+async function assertOwnedPivotJob(jobId, userId, client = pool) {
+  const row = (await client.query(
+    `SELECT j.*,p.base_id,p.table_id FROM pivot_jobs j JOIN pivot_configs p ON p.id=j.pivot_config_id
+     JOIN bases b ON b.id=p.base_id WHERE j.id=$1 AND b.owner_user_id=$2 AND b.deleted_at IS NULL`,
+    [jobId, userId],
+  )).rows[0];
+  if (!row) throw httpError(404, "数据透视任务不存在或无权访问", "PIVOT_JOB_NOT_FOUND");
+  return row;
 }
 
 async function normalizeFieldConfig(tableId, type, input, fieldId = null, client = pool) {
@@ -620,14 +704,19 @@ app.patch("/api/fields/:fieldId", async (req, res, next) => {
     if (type !== current.type && ["relation", "lookup"].includes(current.type)) {
       throw httpError(409, "关联记录和查找引用字段不能直接修改为其他类型，请新建字段后迁移", "RELATIONAL_TYPE_LOCKED");
     }
-    const impact = await getFieldImpact(req.params.fieldId);
-    if (type !== current.type && impact.affectedFields && req.body?.confirmImpact !== true) {
+    const lookupImpact = await getFieldImpact(req.params.fieldId);
+    const catalogImpact = await catalogFieldImpact(req.params.fieldId);
+    const pivotImpact = await pivotFieldImpact(req.params.fieldId);
+    const impact = { ...lookupImpact, catalog: catalogImpact, pivot: pivotImpact };
+    const hasExtendedImpact = lookupImpact.affectedFields || catalogImpact.definitions.length
+      || catalogImpact.configs.length || pivotImpact.configs.length;
+    if (type !== current.type && hasExtendedImpact && req.body?.confirmImpact !== true) {
       throw Object.assign(
         httpError(409, "修改字段类型会影响现有查找引用，请确认影响范围", "FIELD_IMPACT_CONFIRMATION_REQUIRED"),
         { details: impact },
       );
     }
-    if (type !== current.type && impact.affectedFields) {
+    if (type !== current.type && lookupImpact.affectedFields) {
       const dependents = await pool.query(
         `SELECT f.name,f.config FROM lookup_dependencies d JOIN fields f ON f.id=d.lookup_field_id
          WHERE d.target_field_id=$1 AND f.deleted_at IS NULL`,
@@ -647,12 +736,13 @@ app.patch("/api/fields/:fieldId", async (req, res, next) => {
       )).rows[0];
       if (type === "lookup") await saveLookupDependency(client, updated);
       else await removeLookupDependency(client, updated.id);
+      if (type !== current.type) await markCatalogStaleForTarget(client, current.table_id);
       await writeAudit({ actor: req.user.username, action: "update", objectType: "field", objectId: req.params.fieldId, details: { previousType: current.type, type }, ip: req.ip }, client);
       return updated;
     });
     if (type === "lookup") row.calculation = await enqueueLookupJob({ lookupFieldId: row.id, mode: "full", user: req.user });
-    if (type !== current.type && impact.affectedFields) {
-      for (const dependent of impact.dependents) {
+    if (type !== current.type && lookupImpact.affectedFields) {
+      for (const dependent of lookupImpact.dependents) {
         await enqueueLookupJob({ lookupFieldId: dependent.lookup_field_id, mode: "full", user: req.user });
       }
     }
@@ -661,7 +751,12 @@ app.patch("/api/fields/:fieldId", async (req, res, next) => {
 });
 
 app.get("/api/fields/:fieldId/impact", async (req, res, next) => {
-  try { res.json(await getFieldImpact(req.params.fieldId)); }
+  try {
+    const [lookup, catalog, pivot] = await Promise.all([
+      getFieldImpact(req.params.fieldId), catalogFieldImpact(req.params.fieldId), pivotFieldImpact(req.params.fieldId),
+    ]);
+    res.json({ ...lookup, catalog, pivot });
+  }
   catch (error) { next(error); }
 });
 
@@ -692,8 +787,13 @@ app.post("/api/fields/:fieldId/recalculate", async (req, res, next) => {
 
 app.delete("/api/fields/:fieldId", async (req, res, next) => {
   try {
-    const impact = await getFieldImpact(req.params.fieldId);
-    if (impact.affectedFields && req.query.confirmImpact !== "true") {
+    const lookupImpact = await getFieldImpact(req.params.fieldId);
+    const catalogImpact = await catalogFieldImpact(req.params.fieldId);
+    const pivotImpact = await pivotFieldImpact(req.params.fieldId);
+    const impact = { ...lookupImpact, catalog: catalogImpact, pivot: pivotImpact };
+    const hasExtendedImpact = lookupImpact.affectedFields || catalogImpact.definitions.length
+      || catalogImpact.configs.length || pivotImpact.configs.length;
+    if (hasExtendedImpact && req.query.confirmImpact !== "true") {
       throw Object.assign(
         httpError(409, "删除字段会导致现有查找引用失效，请确认影响范围", "FIELD_IMPACT_CONFIRMATION_REQUIRED"),
         { details: impact },
@@ -702,12 +802,12 @@ app.delete("/api/fields/:fieldId", async (req, res, next) => {
     const { rows } = await pool.query("UPDATE fields SET deleted_at=now(),updated_at=now() WHERE id=$1 AND deleted_at IS NULL RETURNING *", [req.params.fieldId]);
     if (!rows.length) throw httpError(404, "字段不存在", "FIELD_NOT_FOUND");
     if (rows[0].type === "lookup") await removeLookupDependency(pool, rows[0].id);
-    if (impact.affectedFields) {
+    if (lookupImpact.affectedFields) {
       await pool.query(
         `UPDATE lookup_values SET status='failed',value=NULL,error_code='LOOKUP_DEPENDENCY_DELETED',
          error_message='目标字段或关联字段已删除',updated_at=now()
          WHERE lookup_field_id=ANY($1::uuid[])`,
-        [impact.dependents.map((item) => item.lookup_field_id)],
+        [lookupImpact.dependents.map((item) => item.lookup_field_id)],
       );
     }
     await writeAudit({ actor: req.user.username, action: "delete", objectType: "field", objectId: req.params.fieldId, ip: req.ip });
@@ -747,6 +847,8 @@ app.post("/api/tables/:tableId/records", async (req, res, next) => {
       await syncRecordRelations(client, { recordId: record.id, tableId: req.params.tableId, values, fields });
       const dirty = await markLookupsDirtyForSource(client, req.params.tableId, [record.id], "source_created");
       await enqueueDirtyLookupJobs(client, dirty, req.user);
+      await markCatalogDirtyForSource(client, req.params.tableId, [record.id], "source_created");
+      await markCatalogStaleForTarget(client, req.params.tableId);
       await writeAudit({ actor: req.user.username, action: "create", objectType: "record", objectId: record.id, details: { tableId: req.params.tableId }, ip: req.ip }, client);
       return record;
     });
@@ -769,6 +871,8 @@ app.post("/api/tables/:tableId/records/bulk", async (req, res, next) => {
       }
       const dirty = await markLookupsDirtyForSource(client, req.params.tableId, rows.map((row) => row.id), "source_bulk_created");
       await enqueueDirtyLookupJobs(client, dirty, req.user);
+      await markCatalogDirtyForSource(client, req.params.tableId, rows.map((row) => row.id), "source_bulk_created");
+      await markCatalogStaleForTarget(client, req.params.tableId);
       await writeAudit({ actor: req.user.username, action: "bulk_create", objectType: "record", details: { tableId: req.params.tableId, count: rows.length }, ip: req.ip }, client);
       return rows;
     });
@@ -793,6 +897,8 @@ app.patch("/api/records/:recordId", async (req, res, next) => {
       const sourceDirty = await markLookupsDirtyForSource(client, current.table_id, [current.id], "source_changed");
       const targetDirty = await markLookupsDirtyForTarget(client, current.table_id, [current.id], "target_changed");
       await enqueueDirtyLookupJobs(client, [...new Set([...sourceDirty, ...targetDirty])], req.user);
+      await markCatalogDirtyForSource(client, current.table_id, [current.id], "source_changed");
+      await markCatalogStaleForTarget(client, current.table_id);
       await writeAudit({ actor: req.user.username, action: "update", objectType: "record", objectId: req.params.recordId, ip: req.ip }, client);
       return rows[0];
     });
@@ -807,6 +913,7 @@ app.delete("/api/records/:recordId", async (req, res, next) => {
       if (!rows.length) throw httpError(404, "记录不存在", "RECORD_NOT_FOUND");
       const dirty = await markLookupsDirtyForTarget(client, rows[0].table_id, [rows[0].id], "target_deleted");
       await enqueueDirtyLookupJobs(client, dirty, req.user);
+      await markCatalogStaleForTarget(client, rows[0].table_id);
       await writeAudit({ actor: req.user.username, action: "delete", objectType: "record", objectId: req.params.recordId, details: { tableId: rows[0].table_id }, ip: req.ip }, client);
     });
     res.status(204).end();
@@ -1079,11 +1186,543 @@ app.post("/api/recycle-bin/:type/:id/restore", async (req, res, next) => {
         const sourceDirty = await markLookupsDirtyForSource(client, rows[0].table_id, [rows[0].id], "source_restored");
         const targetDirty = await markLookupsDirtyForTarget(client, rows[0].table_id, [rows[0].id], "target_restored");
         await enqueueDirtyLookupJobs(client, [...new Set([...sourceDirty, ...targetDirty])], req.user);
+        await markCatalogDirtyForSource(client, rows[0].table_id, [rows[0].id], "source_restored");
+        await markCatalogStaleForTarget(client, rows[0].table_id);
       }
       await writeAudit({ actor: req.user.username, action: "restore", objectType: req.params.type, objectId: req.params.id, ip: req.ip }, client);
       return rows[0];
     });
     res.json(row);
+  } catch (error) { next(error); }
+});
+
+function catalogRuleInput(rule, index) {
+  const sourceFieldIds = Array.isArray(rule?.sourceFieldIds) ? rule.sourceFieldIds.map(String) : [];
+  const targetFieldIds = Array.isArray(rule?.targetFieldIds) ? rule.targetFieldIds.map(String) : [];
+  if (!sourceFieldIds.length || sourceFieldIds.length !== targetFieldIds.length || sourceFieldIds.length > 5) {
+    throw httpError(400, "每条匹配规则必须配置数量相同的源字段和目录字段", "CATALOG_RULE_FIELDS_INVALID");
+  }
+  return {
+    priority: index,
+    sourceFieldIds,
+    targetFieldIds,
+    normalization: {
+      trim: rule?.normalization?.trim !== false,
+      collapseSpaces: rule?.normalization?.collapseSpaces !== false,
+      caseInsensitive: Boolean(rule?.normalization?.caseInsensitive),
+      fullWidth: Boolean(rule?.normalization?.fullWidth),
+      typed: rule?.normalization?.typed !== false,
+    },
+    fuzzy: Boolean(rule?.fuzzy),
+    fuzzyThreshold: Math.max(0.3, Math.min(0.99, Number(rule?.fuzzyThreshold || 0.72))),
+  };
+}
+
+async function validateCatalogRules(sourceTableId, catalogTableId, input, client = pool) {
+  const rules = (Array.isArray(input) ? input : []).slice(0, 8).map(catalogRuleInput);
+  if (!rules.length) throw httpError(400, "请至少配置一条目录匹配规则", "CATALOG_RULE_REQUIRED");
+  const [sourceFields, targetFields] = await Promise.all([
+    getFields(sourceTableId, false, client), getFields(catalogTableId, false, client),
+  ]);
+  const sourceIds = new Set(sourceFields.filter((field) => field.type !== "lookup").map((field) => field.id));
+  const targetIds = new Set(targetFields.filter((field) => field.type !== "lookup").map((field) => field.id));
+  for (const rule of rules) {
+    if (rule.sourceFieldIds.some((id) => !sourceIds.has(id)) || rule.targetFieldIds.some((id) => !targetIds.has(id))) {
+      throw httpError(400, "匹配规则包含不存在、已删除或只读的字段", "CATALOG_RULE_FIELDS_INVALID");
+    }
+  }
+  return rules;
+}
+
+app.get("/api/bases/:baseId/catalog-definitions", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const { rows } = await pool.query(
+      `SELECT d.*,t.name table_name,count(c.id)::int match_config_count
+       FROM catalog_definitions d JOIN data_tables t ON t.id=d.table_id AND t.deleted_at IS NULL
+       LEFT JOIN catalog_match_configs c ON c.definition_id=d.id
+       WHERE d.base_id=$1 GROUP BY d.id,t.name ORDER BY d.updated_at DESC`,
+      [req.params.baseId],
+    );
+    res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/bases/:baseId/catalog-definitions", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const tableId = String(req.body?.tableId || "");
+    const table = (await pool.query(
+      "SELECT * FROM data_tables WHERE id=$1 AND base_id=$2 AND deleted_at IS NULL",
+      [tableId, req.params.baseId],
+    )).rows[0];
+    if (!table) throw httpError(400, "请选择当前项目中的有效目录表", "CATALOG_TABLE_INVALID");
+    const fields = await getFields(tableId);
+    const available = new Set(fields.filter((field) => field.type !== "lookup").map((field) => field.id));
+    const uniqueFieldIds = Array.isArray(req.body?.uniqueFieldIds) ? [...new Set(req.body.uniqueFieldIds.map(String))].slice(0, 5) : [];
+    if (!uniqueFieldIds.length || uniqueFieldIds.some((id) => !available.has(id))) {
+      throw httpError(400, "请选择有效的目录唯一匹配字段", "CATALOG_UNIQUE_FIELDS_INVALID");
+    }
+    const normalization = {
+      trim: req.body?.normalization?.trim !== false,
+      collapseSpaces: req.body?.normalization?.collapseSpaces !== false,
+      caseInsensitive: Boolean(req.body?.normalization?.caseInsensitive),
+      fullWidth: Boolean(req.body?.normalization?.fullWidth),
+      typed: req.body?.normalization?.typed !== false,
+    };
+    const existing = (await pool.query("SELECT * FROM catalog_definitions WHERE table_id=$1", [tableId])).rows[0];
+    if (existing) {
+      const configs = Number((await pool.query("SELECT count(*) value FROM catalog_match_configs WHERE definition_id=$1", [existing.id])).rows[0].value);
+      if (configs && req.body?.confirmImpact !== true) {
+        throw Object.assign(httpError(409, "修改目录匹配字段会影响现有匹配方案，请先确认影响范围", "CATALOG_IMPACT_CONFIRMATION_REQUIRED"), {
+          details: { matchConfigs: configs, definitionId: existing.id },
+        });
+      }
+    }
+    const row = (await pool.query(
+      `INSERT INTO catalog_definitions(base_id,table_id,unique_field_ids,normalization,created_by_user_id,created_by)
+       VALUES($1,$2,$3::jsonb,$4::jsonb,$5,$6)
+       ON CONFLICT(table_id) DO UPDATE SET unique_field_ids=EXCLUDED.unique_field_ids,
+         normalization=EXCLUDED.normalization,index_status='stale',updated_at=now()
+       RETURNING *`,
+      [req.params.baseId, tableId, JSON.stringify(uniqueFieldIds), JSON.stringify(normalization), req.user.id, req.user.username],
+    )).rows[0];
+    const indexed = await rebuildCatalogDefinition(row.id);
+    await writeAudit({ actor: req.user.username, action: existing ? "update" : "create", objectType: "catalog_definition", objectId: row.id, details: { tableId, uniqueFieldIds }, ip: req.ip });
+    res.status(existing ? 200 : 201).json(indexed);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/catalog-definitions/:definitionId/duplicates", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogDefinition(req.params.definitionId, req.user.id);
+    res.json(await getCatalogDuplicates(req.params.definitionId, req.query.limit));
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/catalog-definitions/:definitionId", async (req, res, next) => {
+  try {
+    const definition = await assertOwnedCatalogDefinition(req.params.definitionId, req.user.id);
+    const impact = (await pool.query(
+      `SELECT count(DISTINCT c.id)::int configs,count(DISTINCT j.id)::int jobs,
+       count(DISTINCT r.source_record_id)::bigint records
+       FROM catalog_match_configs c LEFT JOIN catalog_match_jobs j ON j.config_id=c.id
+       LEFT JOIN catalog_match_results r ON r.job_id=j.id WHERE c.definition_id=$1`,
+      [definition.id],
+    )).rows[0];
+    if (impact.configs && req.query.confirmImpact !== "true") {
+      throw Object.assign(httpError(409, "删除目录表定义会影响已有匹配方案和记录，请确认影响范围", "CATALOG_IMPACT_CONFIRMATION_REQUIRED"), { details: impact });
+    }
+    await withTransaction(async (client) => {
+      const fields = (await client.query(
+        "SELECT relation_field_id FROM catalog_match_configs WHERE definition_id=$1 AND relation_field_id IS NOT NULL",
+        [definition.id],
+      )).rows.map((row) => row.relation_field_id);
+      if (fields.length) {
+        await client.query("DELETE FROM record_relations WHERE relation_field_id=ANY($1::uuid[])", [fields]);
+        await client.query("UPDATE fields SET deleted_at=now(),updated_at=now() WHERE id=ANY($1::uuid[])", [fields]);
+      }
+      await client.query("DELETE FROM catalog_match_configs WHERE definition_id=$1", [definition.id]);
+      await client.query("DELETE FROM catalog_definitions WHERE id=$1", [definition.id]);
+      await writeAudit({ actor: req.user.username, action: "delete", objectType: "catalog_definition", objectId: definition.id, details: impact, ip: req.ip }, client);
+    });
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get("/api/bases/:baseId/catalog-configs", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const { rows } = await pool.query(
+      `SELECT c.*,source.name source_table_name,target.name catalog_table_name,d.index_status,d.duplicate_groups,
+       count(DISTINCT rule.id)::int rule_count,
+       count(DISTINCT dirty.source_record_id)::bigint dirty_records
+       FROM catalog_match_configs c JOIN catalog_definitions d ON d.id=c.definition_id
+       JOIN data_tables source ON source.id=c.source_table_id AND source.deleted_at IS NULL
+       JOIN data_tables target ON target.id=d.table_id AND target.deleted_at IS NULL
+       LEFT JOIN catalog_match_rules rule ON rule.config_id=c.id
+       LEFT JOIN catalog_dirty_records dirty ON dirty.config_id=c.id
+       WHERE c.base_id=$1 GROUP BY c.id,source.name,target.name,d.index_status,d.duplicate_groups
+       ORDER BY c.updated_at DESC`,
+      [req.params.baseId],
+    );
+    res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/bases/:baseId/catalog-configs", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const name = String(req.body?.name || "").trim();
+    const sourceTableId = String(req.body?.sourceTableId || "");
+    const definitionId = String(req.body?.definitionId || "");
+    if (!name) throw httpError(400, "目录匹配方案名称不能为空", "CATALOG_CONFIG_NAME_REQUIRED");
+    const definition = await assertOwnedCatalogDefinition(definitionId, req.user.id);
+    if (definition.base_id !== req.params.baseId) throw httpError(400, "目录表不属于当前项目", "CATALOG_BASE_MISMATCH");
+    const source = (await pool.query(
+      "SELECT id FROM data_tables WHERE id=$1 AND base_id=$2 AND deleted_at IS NULL",
+      [sourceTableId, req.params.baseId],
+    )).rows[0];
+    if (!source) throw httpError(400, "请选择有效的业务数据表", "CATALOG_SOURCE_TABLE_INVALID");
+    const rules = await validateCatalogRules(sourceTableId, definition.table_id, req.body?.rules);
+    const row = await withTransaction(async (client) => {
+      const config = (await client.query(
+        `INSERT INTO catalog_match_configs(base_id,name,source_table_id,definition_id,created_by_user_id,created_by)
+         VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [req.params.baseId, name, sourceTableId, definitionId, req.user.id, req.user.username],
+      )).rows[0];
+      for (const rule of rules) await client.query(
+        `INSERT INTO catalog_match_rules(config_id,priority,source_field_ids,target_field_ids,normalization,fuzzy,fuzzy_threshold)
+         VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7)`,
+        [config.id, rule.priority, JSON.stringify(rule.sourceFieldIds), JSON.stringify(rule.targetFieldIds), JSON.stringify(rule.normalization), rule.fuzzy, rule.fuzzyThreshold],
+      );
+      await writeAudit({ actor: req.user.username, action: "create", objectType: "catalog_config", objectId: config.id, details: { sourceTableId, definitionId, rules: rules.length }, ip: req.ip }, client);
+      return config;
+    });
+    res.status(201).json(row);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/catalog-configs/:configId", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    const config = (await pool.query(
+      `SELECT c.*,d.table_id catalog_table_id,d.index_status,d.duplicate_groups,
+       source.name source_table_name,target.name catalog_table_name,
+       (SELECT count(*)::bigint FROM catalog_dirty_records dirty WHERE dirty.config_id=c.id) dirty_records
+       FROM catalog_match_configs c JOIN catalog_definitions d ON d.id=c.definition_id
+       JOIN data_tables source ON source.id=c.source_table_id AND source.deleted_at IS NULL
+       JOIN data_tables target ON target.id=d.table_id AND target.deleted_at IS NULL WHERE c.id=$1`,
+      [req.params.configId],
+    )).rows[0];
+    const [rules, jobs, aliases] = await Promise.all([
+      pool.query("SELECT * FROM catalog_match_rules WHERE config_id=$1 ORDER BY priority", [config.id]),
+      pool.query("SELECT * FROM catalog_match_jobs WHERE config_id=$1 ORDER BY created_at DESC LIMIT 30", [config.id]),
+      pool.query("SELECT * FROM catalog_aliases WHERE config_id=$1 ORDER BY updated_at DESC LIMIT 100", [config.id]),
+    ]);
+    res.json({ ...config, rules: rules.rows, jobs: jobs.rows, aliases: aliases.rows });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/catalog-configs/:configId", async (req, res, next) => {
+  try {
+    const config = await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    const name = req.body?.name === undefined ? config.name : String(req.body.name).trim();
+    if (!name) throw httpError(400, "目录匹配方案名称不能为空", "CATALOG_CONFIG_NAME_REQUIRED");
+    const definition = (await pool.query("SELECT table_id FROM catalog_definitions WHERE id=$1", [config.definition_id])).rows[0];
+    const rules = req.body?.rules === undefined ? null : await validateCatalogRules(config.source_table_id, definition.table_id, req.body.rules);
+    const result = await withTransaction(async (client) => {
+      const updated = (await client.query(
+        "UPDATE catalog_match_configs SET name=$2,updated_at=now() WHERE id=$1 RETURNING *",
+        [config.id, name],
+      )).rows[0];
+      if (rules) {
+        await client.query("DELETE FROM catalog_match_rules WHERE config_id=$1", [config.id]);
+        for (const rule of rules) await client.query(
+          `INSERT INTO catalog_match_rules(config_id,priority,source_field_ids,target_field_ids,normalization,fuzzy,fuzzy_threshold)
+           VALUES($1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6,$7)`,
+          [config.id, rule.priority, JSON.stringify(rule.sourceFieldIds), JSON.stringify(rule.targetFieldIds), JSON.stringify(rule.normalization), rule.fuzzy, rule.fuzzyThreshold],
+        );
+      }
+      await writeAudit({ actor: req.user.username, action: "update", objectType: "catalog_config", objectId: config.id, details: { rules: rules?.length }, ip: req.ip }, client);
+      return updated;
+    });
+    res.json(result);
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/catalog-configs/:configId", async (req, res, next) => {
+  try {
+    const config = await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    const impact = (await pool.query(
+      `SELECT count(DISTINCT j.id)::int jobs,count(DISTINCT r.source_record_id)::bigint records
+       FROM catalog_match_jobs j LEFT JOIN catalog_match_results r ON r.job_id=j.id WHERE j.config_id=$1`,
+      [config.id],
+    )).rows[0];
+    if ((impact.jobs || Number(impact.records)) && req.query.confirmImpact !== "true") {
+      throw Object.assign(httpError(409, "删除匹配方案会删除任务历史和别名规则，请确认影响范围", "CATALOG_IMPACT_CONFIRMATION_REQUIRED"), { details: impact });
+    }
+    await withTransaction(async (client) => {
+      if (config.relation_field_id) {
+        await client.query("DELETE FROM record_relations WHERE relation_field_id=$1", [config.relation_field_id]);
+        await client.query("UPDATE fields SET deleted_at=now(),updated_at=now() WHERE id=$1", [config.relation_field_id]);
+      }
+      await client.query("DELETE FROM catalog_match_configs WHERE id=$1", [config.id]);
+      await writeAudit({ actor: req.user.username, action: "delete", objectType: "catalog_config", objectId: config.id, details: impact, ip: req.ip }, client);
+    });
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.post("/api/catalog-configs/:configId/preview", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    const job = await enqueueCatalogPreview({ configId: req.params.configId, mode: req.body?.mode || "full", user: req.user });
+    await writeAudit({ actor: req.user.username, action: "preview", objectType: "catalog_job", objectId: job.id, details: { mode: job.mode }, ip: req.ip });
+    res.status(202).json(job);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/catalog-configs/:configId/jobs", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogConfig(req.params.configId, req.user.id);
+    const { rows } = await pool.query("SELECT * FROM catalog_match_jobs WHERE config_id=$1 ORDER BY created_at DESC LIMIT 100", [req.params.configId]);
+    res.json(rows);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/catalog-jobs/:jobId", async (req, res, next) => {
+  try {
+    const job = await assertOwnedCatalogJob(req.params.jobId, req.user.id);
+    res.json(job);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/catalog-jobs/:jobId/apply", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogJob(req.params.jobId, req.user.id);
+    const job = await startCatalogApply(req.params.jobId);
+    await writeAudit({ actor: req.user.username, action: "apply", objectType: "catalog_job", objectId: job.id, details: { matched: job.total_records }, ip: req.ip });
+    res.status(202).json(job);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/catalog-jobs/:jobId/action", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogJob(req.params.jobId, req.user.id);
+    const job = await setCatalogJobAction(req.params.jobId, String(req.body?.action || ""));
+    await writeAudit({ actor: req.user.username, action: String(req.body?.action || ""), objectType: "catalog_job", objectId: job.id, ip: req.ip });
+    res.json(job);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/catalog-jobs/:jobId/results", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogJob(req.params.jobId, req.user.id);
+    const status = ["matched", "unmatched", "conflict", "manual_confirmed", "failed"].includes(req.query.status) ? req.query.status : null;
+    const after = /^\d+$/.test(String(req.query.after || "")) ? String(req.query.after) : "0";
+    const limit = parseLimit(req.query.limit, 100, 200);
+    const params = [req.params.jobId, after, limit + 1];
+    const statusClause = status ? `AND result.status=$4` : "";
+    if (status) params.push(status);
+    const { rows } = await pool.query(
+      `SELECT result.*,source.values source_record_values,target.values target_record_values,
+       COALESCE((SELECT jsonb_agg(jsonb_build_object('id',candidate.id,'values',candidate.values) ORDER BY candidate.id)
+         FROM records candidate WHERE candidate.id IN
+           (SELECT value::bigint FROM jsonb_array_elements_text(result.candidate_record_ids))), '[]'::jsonb) candidates
+       FROM catalog_match_results result
+       JOIN records source ON source.id=result.source_record_id
+       LEFT JOIN records target ON target.id=result.target_record_id
+       WHERE result.job_id=$1 AND result.source_record_id>$2 ${statusClause}
+       ORDER BY result.source_record_id LIMIT $3`,
+      params,
+    );
+    const hasMore = rows.length > limit;
+    res.json({ results: rows.slice(0, limit), hasMore, nextAfter: rows.length ? String(rows[Math.min(rows.length, limit) - 1].source_record_id) : null });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/catalog-jobs/:jobId/results/:sourceRecordId/confirm", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogJob(req.params.jobId, req.user.id);
+    const result = await confirmCatalogResult({
+      jobId: req.params.jobId,
+      sourceRecordId: req.params.sourceRecordId,
+      targetRecordId: String(req.body?.targetRecordId || ""),
+      saveAlias: Boolean(req.body?.saveAlias),
+      user: req.user,
+    });
+    await writeAudit({ actor: req.user.username, action: "manual_confirm", objectType: "catalog_result", objectId: `${req.params.jobId}:${req.params.sourceRecordId}`, details: { saveAlias: Boolean(req.body?.saveAlias) }, ip: req.ip });
+    res.json(result);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/catalog-jobs/:jobId/undo", async (req, res, next) => {
+  try {
+    await assertOwnedCatalogJob(req.params.jobId, req.user.id);
+    const result = await undoCatalogJob(req.params.jobId, req.user);
+    await writeAudit({ actor: req.user.username, action: "undo", objectType: "catalog_job", objectId: req.params.jobId, details: result, ip: req.ip });
+    res.json(result);
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/catalog-aliases/:aliasId", async (req, res, next) => {
+  try {
+    const alias = (await pool.query(
+      `SELECT a.* FROM catalog_aliases a JOIN catalog_match_configs c ON c.id=a.config_id
+       JOIN bases b ON b.id=c.base_id WHERE a.id=$1 AND b.owner_user_id=$2`,
+      [req.params.aliasId, req.user.id],
+    )).rows[0];
+    if (!alias) throw httpError(404, "别名规则不存在", "CATALOG_ALIAS_NOT_FOUND");
+    await pool.query("DELETE FROM catalog_aliases WHERE id=$1", [alias.id]);
+    await writeAudit({ actor: req.user.username, action: "delete", objectType: "catalog_alias", objectId: alias.id, ip: req.ip });
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get("/api/bases/:baseId/pivot-configs", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const rows = (await pool.query(
+      `SELECT p.*,t.name table_name,j.status job_status,j.progress,j.result_rows,j.completed_at job_completed_at
+       FROM pivot_configs p JOIN data_tables t ON t.id=p.table_id AND t.deleted_at IS NULL
+       LEFT JOIN pivot_jobs j ON j.id=p.last_job_id WHERE p.base_id=$1 ORDER BY p.updated_at DESC`,
+      [req.params.baseId],
+    )).rows;
+    res.json(await Promise.all(rows.map(getPivotConfigState)));
+  } catch (error) { next(error); }
+});
+
+app.post("/api/bases/:baseId/pivot-configs", async (req, res, next) => {
+  try {
+    await assertOwnedBase(req.params.baseId, req.user.id);
+    const name = String(req.body?.name || "").trim();
+    const tableId = String(req.body?.tableId || "");
+    if (!name) throw httpError(400, "数据透视名称不能为空", "PIVOT_NAME_REQUIRED");
+    const table = (await pool.query("SELECT id FROM data_tables WHERE id=$1 AND base_id=$2 AND deleted_at IS NULL", [tableId, req.params.baseId])).rows[0];
+    if (!table) throw httpError(400, "请选择有效的数据表", "PIVOT_TABLE_INVALID");
+    const { config } = await validatePivotConfig(tableId, req.body?.config || {});
+    const row = (await pool.query(
+      `INSERT INTO pivot_configs(base_id,table_id,name,config,created_by_user_id,created_by)
+       VALUES($1,$2,$3,$4::jsonb,$5,$6) RETURNING *`,
+      [req.params.baseId, tableId, name, JSON.stringify(config), req.user.id, req.user.username],
+    )).rows[0];
+    await writeAudit({ actor: req.user.username, action: "create", objectType: "pivot_config", objectId: row.id, details: { tableId }, ip: req.ip });
+    res.status(201).json(await getPivotConfigState(row));
+  } catch (error) { next(error); }
+});
+
+app.get("/api/pivot-configs/:configId", async (req, res, next) => {
+  try {
+    await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    const config = (await pool.query(
+      `SELECT p.*,t.name table_name FROM pivot_configs p
+       JOIN data_tables t ON t.id=p.table_id AND t.deleted_at IS NULL WHERE p.id=$1`,
+      [req.params.configId],
+    )).rows[0];
+    const jobs = (await pool.query("SELECT * FROM pivot_jobs WHERE pivot_config_id=$1 ORDER BY created_at DESC LIMIT 30", [config.id])).rows;
+    res.json({ ...(await getPivotConfigState(config)), jobs });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/pivot-configs/:configId", async (req, res, next) => {
+  try {
+    const current = await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    const name = req.body?.name === undefined ? current.name : String(req.body.name).trim();
+    if (!name) throw httpError(400, "数据透视名称不能为空", "PIVOT_NAME_REQUIRED");
+    const config = req.body?.config === undefined ? normalizePivotConfig(current.config, await getFields(current.table_id))
+      : (await validatePivotConfig(current.table_id, req.body.config)).config;
+    const row = (await pool.query(
+      "UPDATE pivot_configs SET name=$2,config=$3::jsonb,updated_at=now() WHERE id=$1 RETURNING *",
+      [current.id, name, JSON.stringify(config)],
+    )).rows[0];
+    await writeAudit({ actor: req.user.username, action: "update", objectType: "pivot_config", objectId: row.id, ip: req.ip });
+    res.json(await getPivotConfigState(row));
+  } catch (error) { next(error); }
+});
+
+app.post("/api/pivot-configs/:configId/copy", async (req, res, next) => {
+  try {
+    const current = await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    const name = String(req.body?.name || `${current.name} 副本`).trim();
+    const row = (await pool.query(
+      `INSERT INTO pivot_configs(base_id,table_id,name,config,created_by_user_id,created_by)
+       VALUES($1,$2,$3,$4::jsonb,$5,$6) RETURNING *`,
+      [current.base_id, current.table_id, name, JSON.stringify(current.config), req.user.id, req.user.username],
+    )).rows[0];
+    await writeAudit({ actor: req.user.username, action: "copy", objectType: "pivot_config", objectId: row.id, details: { sourceId: current.id }, ip: req.ip });
+    res.status(201).json(await getPivotConfigState(row));
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/pivot-configs/:configId", async (req, res, next) => {
+  try {
+    const current = await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    await pool.query("DELETE FROM pivot_configs WHERE id=$1", [current.id]);
+    await writeAudit({ actor: req.user.username, action: "delete", objectType: "pivot_config", objectId: current.id, ip: req.ip });
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.post("/api/pivot-configs/:configId/calculate", async (req, res, next) => {
+  try {
+    await assertOwnedPivotConfig(req.params.configId, req.user.id);
+    const job = await enqueuePivotJob({ pivotConfigId: req.params.configId, user: req.user });
+    await writeAudit({ actor: req.user.username, action: "calculate", objectType: "pivot_job", objectId: job.id, details: { cached: Boolean(job.cached) }, ip: req.ip });
+    res.status(job.cached ? 200 : 202).json(job);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/pivot-jobs/:jobId", async (req, res, next) => {
+  try {
+    await assertOwnedPivotJob(req.params.jobId, req.user.id);
+    res.json(await getPivotRows(req.params.jobId, { offset: req.query.offset, limit: req.query.limit }));
+  } catch (error) { next(error); }
+});
+
+app.post("/api/pivot-jobs/:jobId/cancel", async (req, res, next) => {
+  try {
+    await assertOwnedPivotJob(req.params.jobId, req.user.id);
+    const job = await cancelPivotJob(req.params.jobId);
+    await writeAudit({ actor: req.user.username, action: "cancel", objectType: "pivot_job", objectId: job.id, ip: req.ip });
+    res.json(job);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/pivot-jobs/:jobId/drilldown/:rowIndex", async (req, res, next) => {
+  try {
+    await assertOwnedPivotJob(req.params.jobId, req.user.id);
+    res.json(await getPivotDrilldown(req.params.jobId, req.params.rowIndex, { offset: req.query.offset, limit: req.query.limit }));
+  } catch (error) { next(error); }
+});
+
+app.get("/api/pivot-jobs/:jobId/export-estimate", async (req, res, next) => {
+  try {
+    const job = await assertOwnedPivotJob(req.params.jobId, req.user.id);
+    res.json(estimatePivotExport(job, req.query.format));
+  } catch (error) { next(error); }
+});
+
+app.get("/api/pivot-jobs/:jobId/export.:format", async (req, res, next) => {
+  try {
+    const job = await assertOwnedPivotJob(req.params.jobId, req.user.id);
+    if (job.status !== "completed") throw httpError(409, "数据透视计算完成后才能导出", "PIVOT_JOB_NOT_READY");
+    const format = req.params.format === "csv" ? "csv" : "xlsx";
+    const fields = await getFields(job.table_id);
+    const fieldMap = new Map(fields.map((field) => [field.id, field]));
+    const config = normalizePivotConfig(job.config_snapshot, fields);
+    const headers = [
+      ...config.rows.map((item) => fieldMap.get(item.fieldId)?.name || item.fieldId),
+      ...config.columns.map((item) => fieldMap.get(item.fieldId)?.name || item.fieldId),
+      ...config.measures.map((item) => item.label),
+    ];
+    const filename = `pivot-${job.id}.${format}`;
+    if (format === "csv") {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.write(`\uFEFF${headers.map(csvCell).join(",")}\r\n`);
+      for (let offset = 0; offset < Number(job.result_rows); offset += 500) {
+        const page = await getPivotRows(job.id, { offset, limit: 500 });
+        for (const row of page.rows) {
+          const values = [...row.row_key, ...row.column_key, ...config.measures.map((measure) => row.values?.[measure.id] ?? "")];
+          res.write(`${values.map(csvCell).join(",")}\r\n`);
+        }
+      }
+      return res.end();
+    }
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res });
+    const sheet = workbook.addWorksheet("数据透视");
+    sheet.addRow(headers).commit();
+    for (let offset = 0; offset < Number(job.result_rows); offset += 500) {
+      const page = await getPivotRows(job.id, { offset, limit: 500 });
+      for (const row of page.rows) {
+        sheet.addRow([...row.row_key, ...row.column_key, ...config.measures.map((measure) => row.values?.[measure.id] ?? "")]).commit();
+      }
+    }
+    sheet.commit();
+    await workbook.commit();
   } catch (error) { next(error); }
 });
 
@@ -1128,6 +1767,8 @@ app.use((error, _req, res, _next) => {
 
 await initializeDatabase();
 await startLookupWorker();
+await startCatalogWorker();
+await startPivotWorker();
 const server = app.listen(port, "0.0.0.0", () => console.log(`multibase-v1 listening on ${port}`));
 
 async function shutdown(signal) {

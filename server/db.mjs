@@ -10,6 +10,7 @@ export const pool = new Pool({
 
 const schema = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS app_settings (
   key text PRIMARY KEY,
@@ -201,6 +202,207 @@ CREATE TABLE IF NOT EXISTS lookup_job_failures (
 );
 CREATE INDEX IF NOT EXISTS lookup_job_failures_field_idx
   ON lookup_job_failures(lookup_field_id, source_record_id);
+
+CREATE TABLE IF NOT EXISTS catalog_definitions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  base_id uuid NOT NULL REFERENCES bases(id) ON DELETE CASCADE,
+  table_id uuid NOT NULL UNIQUE REFERENCES data_tables(id) ON DELETE CASCADE,
+  unique_field_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  normalization jsonb NOT NULL DEFAULT '{}'::jsonb,
+  index_status text NOT NULL DEFAULT 'stale' CHECK (index_status IN ('stale','building','ready','duplicate','failed')),
+  duplicate_groups integer NOT NULL DEFAULT 0,
+  duplicate_records bigint NOT NULL DEFAULT 0,
+  indexed_at timestamptz,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_by text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS catalog_definitions_base_idx ON catalog_definitions(base_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_definition_index (
+  definition_id uuid NOT NULL REFERENCES catalog_definitions(id) ON DELETE CASCADE,
+  catalog_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  normalized_key text NOT NULL,
+  key_values jsonb NOT NULL DEFAULT '[]'::jsonb,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (definition_id, catalog_record_id)
+);
+CREATE INDEX IF NOT EXISTS catalog_definition_key_idx ON catalog_definition_index(definition_id, normalized_key);
+CREATE INDEX IF NOT EXISTS catalog_definition_trgm_idx ON catalog_definition_index USING gin(normalized_key gin_trgm_ops);
+
+CREATE TABLE IF NOT EXISTS catalog_match_configs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  base_id uuid NOT NULL REFERENCES bases(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  source_table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  definition_id uuid NOT NULL REFERENCES catalog_definitions(id) ON DELETE RESTRICT,
+  relation_field_id uuid REFERENCES fields(id) ON DELETE SET NULL,
+  last_completed_at timestamptz,
+  last_source_version text,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_by text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS catalog_match_configs_name_unique
+  ON catalog_match_configs(base_id, lower(name));
+CREATE INDEX IF NOT EXISTS catalog_match_configs_source_idx ON catalog_match_configs(source_table_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_match_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  config_id uuid NOT NULL REFERENCES catalog_match_configs(id) ON DELETE CASCADE,
+  priority integer NOT NULL DEFAULT 0,
+  source_field_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  target_field_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  normalization jsonb NOT NULL DEFAULT '{}'::jsonb,
+  fuzzy boolean NOT NULL DEFAULT false,
+  fuzzy_threshold numeric(4,3) NOT NULL DEFAULT 0.72,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS catalog_match_rules_priority_unique ON catalog_match_rules(config_id, priority);
+
+CREATE TABLE IF NOT EXISTS catalog_match_index (
+  rule_id uuid NOT NULL REFERENCES catalog_match_rules(id) ON DELETE CASCADE,
+  catalog_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  normalized_key text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (rule_id, catalog_record_id)
+);
+CREATE INDEX IF NOT EXISTS catalog_match_index_key_idx ON catalog_match_index(rule_id, normalized_key);
+CREATE INDEX IF NOT EXISTS catalog_match_index_trgm_idx ON catalog_match_index USING gin(normalized_key gin_trgm_ops);
+
+CREATE TABLE IF NOT EXISTS catalog_aliases (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  config_id uuid NOT NULL REFERENCES catalog_match_configs(id) ON DELETE CASCADE,
+  source_signature text NOT NULL,
+  source_values jsonb NOT NULL DEFAULT '[]'::jsonb,
+  target_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_by text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(config_id, source_signature)
+);
+CREATE INDEX IF NOT EXISTS catalog_aliases_target_idx ON catalog_aliases(target_record_id);
+
+CREATE TABLE IF NOT EXISTS catalog_match_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  config_id uuid NOT NULL REFERENCES catalog_match_configs(id) ON DELETE CASCADE,
+  requested_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  requested_by text NOT NULL,
+  mode text NOT NULL DEFAULT 'full' CHECK (mode IN ('full','incremental','retry_failed')),
+  stage text NOT NULL DEFAULT 'preview' CHECK (stage IN ('preview','apply')),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','computing','paused','completed','partial','failed','cancelled','reverted')),
+  total_records bigint NOT NULL DEFAULT 0,
+  processed_records bigint NOT NULL DEFAULT 0,
+  matched_records bigint NOT NULL DEFAULT 0,
+  unmatched_records bigint NOT NULL DEFAULT 0,
+  conflict_records bigint NOT NULL DEFAULT 0,
+  manual_records bigint NOT NULL DEFAULT 0,
+  applied_records bigint NOT NULL DEFAULT 0,
+  batch_size integer NOT NULL DEFAULT 1000,
+  last_record_id bigint NOT NULL DEFAULT 0,
+  rules_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  applied_at timestamptz,
+  reverted_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS catalog_match_jobs_one_active_idx
+  ON catalog_match_jobs(config_id) WHERE status IN ('pending','computing','paused');
+CREATE INDEX IF NOT EXISTS catalog_match_jobs_status_idx ON catalog_match_jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS catalog_match_results (
+  job_id uuid NOT NULL REFERENCES catalog_match_jobs(id) ON DELETE CASCADE,
+  source_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  status text NOT NULL CHECK (status IN ('matched','unmatched','conflict','manual_confirmed','failed')),
+  target_record_id bigint REFERENCES records(id) ON DELETE SET NULL,
+  candidate_record_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  matched_rule_id uuid REFERENCES catalog_match_rules(id) ON DELETE SET NULL,
+  match_method text,
+  source_signature text,
+  source_values jsonb NOT NULL DEFAULT '[]'::jsonb,
+  previous_target_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  applied_target_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  applied boolean NOT NULL DEFAULT false,
+  error_message text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (job_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS catalog_match_results_status_idx ON catalog_match_results(job_id, status, source_record_id);
+CREATE INDEX IF NOT EXISTS catalog_match_results_source_idx ON catalog_match_results(source_record_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_dirty_records (
+  config_id uuid NOT NULL REFERENCES catalog_match_configs(id) ON DELETE CASCADE,
+  source_record_id bigint NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+  reason text NOT NULL DEFAULT 'source_changed',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (config_id, source_record_id)
+);
+CREATE INDEX IF NOT EXISTS catalog_dirty_created_idx ON catalog_dirty_records(config_id, created_at, source_record_id);
+
+CREATE TABLE IF NOT EXISTS pivot_configs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  base_id uuid NOT NULL REFERENCES bases(id) ON DELETE CASCADE,
+  table_id uuid NOT NULL REFERENCES data_tables(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  config jsonb NOT NULL DEFAULT '{}'::jsonb,
+  last_calculated_source_version text,
+  last_job_id uuid,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_by text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS pivot_configs_name_unique ON pivot_configs(base_id, lower(name));
+CREATE INDEX IF NOT EXISTS pivot_configs_table_idx ON pivot_configs(table_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS pivot_jobs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  pivot_config_id uuid NOT NULL REFERENCES pivot_configs(id) ON DELETE CASCADE,
+  requested_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  requested_by text NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','computing','completed','failed','cancelled')),
+  config_hash text NOT NULL,
+  config_snapshot jsonb NOT NULL DEFAULT '{}'::jsonb,
+  source_version text NOT NULL,
+  source_records bigint NOT NULL DEFAULT 0,
+  processed_records bigint NOT NULL DEFAULT 0,
+  result_rows bigint NOT NULL DEFAULT 0,
+  progress integer NOT NULL DEFAULT 0,
+  backend_pid integer,
+  cached_from_job_id uuid REFERENCES pivot_jobs(id) ON DELETE SET NULL,
+  error_message text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  expires_at timestamptz NOT NULL DEFAULT now() + interval '10 minutes'
+);
+ALTER TABLE pivot_configs DROP CONSTRAINT IF EXISTS pivot_configs_last_job_id_fkey;
+ALTER TABLE pivot_configs ADD CONSTRAINT pivot_configs_last_job_id_fkey
+  FOREIGN KEY (last_job_id) REFERENCES pivot_jobs(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED;
+CREATE UNIQUE INDEX IF NOT EXISTS pivot_jobs_one_active_idx
+  ON pivot_jobs(pivot_config_id) WHERE status IN ('pending','computing');
+CREATE INDEX IF NOT EXISTS pivot_jobs_cache_idx ON pivot_jobs(config_hash, source_version, completed_at DESC)
+  WHERE status='completed';
+CREATE INDEX IF NOT EXISTS pivot_jobs_status_idx ON pivot_jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS pivot_job_rows (
+  job_id uuid NOT NULL REFERENCES pivot_jobs(id) ON DELETE CASCADE,
+  row_index bigint NOT NULL,
+  row_key jsonb NOT NULL DEFAULT '[]'::jsonb,
+  column_key jsonb NOT NULL DEFAULT '[]'::jsonb,
+  values jsonb NOT NULL DEFAULT '{}'::jsonb,
+  row_level integer NOT NULL DEFAULT 0,
+  column_level integer NOT NULL DEFAULT 0,
+  is_total boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (job_id, row_index)
+);
+CREATE INDEX IF NOT EXISTS pivot_job_rows_page_idx ON pivot_job_rows(job_id, row_index);
 
 CREATE TABLE IF NOT EXISTS import_jobs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
