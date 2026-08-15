@@ -270,8 +270,8 @@ body:has(.feature-modal) .feature-page { overflow: visible; }
 .task-filters label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .task-filters select { width: 160px; min-height: 32px; padding: 0 9px; }
 .task-filters > span { margin-left: auto; color: var(--tertiary); font-size: 12px; }
-.task-table-wrap { min-width: 1080px; overflow: auto; border: 1px solid var(--border); background: white; }
-.task-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.task-table-wrap { width: 100%; min-width: 0; overflow: auto; border: 1px solid var(--border); background: white; }
+.task-table { width: 100%; min-width: 1080px; border-collapse: collapse; table-layout: fixed; }
 .task-table th { height: 40px; padding: 0 12px; color: var(--muted); background: #fafbfc; text-align: left; font-size: 12px; font-weight: 500; }
 .task-table th:nth-child(1) { width: 210px; }.task-table th:nth-child(2) { width: 100px; }.task-table th:nth-child(3) { width: 220px; }.task-table th:nth-child(4) { width: 130px; }.task-table th:nth-child(5),.task-table th:nth-child(6) { width: 155px; }.task-table th:nth-child(7) { width: 90px; }.task-table th:nth-child(8) { width: 70px; }
 .task-table td { height: 70px; padding: 9px 12px; border-top: 1px solid var(--border); vertical-align: middle; font-size: 12px; }
